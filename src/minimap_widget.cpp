@@ -88,17 +88,9 @@ void MinimapWidget::setCurrentAddress(data_addr_t addr) {
     }
 }
 
-void MinimapWidget::setVisibleRange(data_addr_t start, data_addr_t end) {
-    if (visible_start_ != start || visible_end_ != end) {
-        visible_start_ = start;
-        visible_end_ = end;
-        update();
-    }
-}
-
-void MinimapWidget::setShowViewportFrame(bool show) {
-    if (show_viewport_frame_ != show) {
-        show_viewport_frame_ = show;
+void MinimapWidget::setShowCursorGap(bool show) {
+    if (show_cursor_gap_ != show) {
+        show_cursor_gap_ = show;
         update();
     }
 }
@@ -132,7 +124,47 @@ data_addr_t MinimapWidget::positionToAddress(const QPoint& pos) const {
     const QRect content = contentRect();
     
     if (vertical_layout_) {
-        const int y = pos.y() - content.top();
+        int y = pos.y() - content.top();
+        
+        // Account for cursor gap if active
+        if (show_cursor_gap_ && show_cursor_ && current_addr_ != DATA_BADADDR && 
+            !cache_image_.isNull() && cache_image_.height() > 0) {
+            
+            const int cursor_cache_y = data_source_->address_to_y(current_addr_, cache_image_.height());
+            if (cursor_cache_y >= 0 && cursor_cache_y < cache_image_.height()) {
+                const int gap_height = QT_CURSOR_GAP_HEIGHT;
+                const int half_gap = gap_height / 2;
+                const double cursor_frac = static_cast<double>(cursor_cache_y) / cache_image_.height();
+                const int gap_center_y = static_cast<int>(cursor_frac * content.height());
+                const int gap_top = std::max(half_gap, std::min(content.height() - half_gap, gap_center_y)) - half_gap;
+                const int gap_bottom = gap_top + gap_height;
+                
+                // Map screen position to cache position
+                if (y >= gap_bottom) {
+                    // Below the gap: map to bottom portion of cache
+                    const int screen_bottom_start = gap_bottom;
+                    const int screen_bottom_height = content.height() - gap_bottom;
+                    const int cache_bottom_height = cache_image_.height() - cursor_cache_y;
+                    
+                    if (screen_bottom_height > 0 && cache_bottom_height > 0) {
+                        const double t = static_cast<double>(y - screen_bottom_start) / screen_bottom_height;
+                        y = cursor_cache_y + static_cast<int>(t * cache_bottom_height);
+                    }
+                } else if (y >= gap_top) {
+                    // In the gap: return cursor address
+                    return current_addr_;
+                } else {
+                    // Above the gap: map to top portion of cache
+                    if (gap_top > 0 && cursor_cache_y > 0) {
+                        const double t = static_cast<double>(y) / gap_top;
+                        y = static_cast<int>(t * cursor_cache_y);
+                    }
+                }
+                
+                return data_source_->y_to_address(y, cache_image_.height());
+            }
+        }
+        
         return data_source_->y_to_address(y, content.height());
     } else {
         const int x = pos.x() - content.left();
@@ -148,8 +180,45 @@ int MinimapWidget::addressToPosition(data_addr_t addr) const {
     const QRect content = contentRect();
     
     if (vertical_layout_) {
-        const int y = data_source_->address_to_y(addr, content.height());
-        return (y >= 0) ? y + content.top() : -1;
+        // Get position in cache coordinates
+        const int cache_height = cache_image_.isNull() ? content.height() : cache_image_.height();
+        const int cache_y = data_source_->address_to_y(addr, cache_height);
+        if (cache_y < 0) return -1;
+        
+        // Account for cursor gap if active
+        if (show_cursor_gap_ && show_cursor_ && current_addr_ != DATA_BADADDR && 
+            !cache_image_.isNull() && cache_image_.height() > 0) {
+            
+            const int cursor_cache_y = data_source_->address_to_y(current_addr_, cache_image_.height());
+            if (cursor_cache_y >= 0 && cursor_cache_y < cache_image_.height()) {
+                const int gap_height = QT_CURSOR_GAP_HEIGHT;
+                const int half_gap = gap_height / 2;
+                const double cursor_frac = static_cast<double>(cursor_cache_y) / cache_image_.height();
+                const int gap_center_y = static_cast<int>(cursor_frac * content.height());
+                const int gap_top = std::max(half_gap, std::min(content.height() - half_gap, gap_center_y)) - half_gap;
+                const int gap_bottom = gap_top + gap_height;
+                
+                // Map cache position to screen position
+                if (cache_y >= cursor_cache_y) {
+                    // Below cursor: map to bottom portion of screen
+                    const int cache_bottom_height = cache_image_.height() - cursor_cache_y;
+                    const int screen_bottom_height = content.height() - gap_bottom;
+                    
+                    if (cache_bottom_height > 0 && screen_bottom_height > 0) {
+                        const double t = static_cast<double>(cache_y - cursor_cache_y) / cache_bottom_height;
+                        return content.top() + gap_bottom + static_cast<int>(t * screen_bottom_height);
+                    }
+                } else {
+                    // Above cursor: map to top portion of screen
+                    if (cursor_cache_y > 0 && gap_top > 0) {
+                        const double t = static_cast<double>(cache_y) / cursor_cache_y;
+                        return content.top() + static_cast<int>(t * gap_top);
+                    }
+                }
+            }
+        }
+        
+        return cache_y + content.top();
     } else {
         const int x = data_source_->address_to_x(addr, content.width());
         return (x >= 0) ? x + content.left() : -1;
@@ -266,9 +335,50 @@ void MinimapWidget::drawContent(QPainter& painter) {
         renderToCache();
     }
     
-    // Draw cached image
-    if (cache_valid_ && !cache_image_.isNull()) {
+    if (!cache_valid_ || cache_image_.isNull()) {
+        return;
+    }
+    
+    // If no cursor gap or no valid cursor, draw normally
+    if (!show_cursor_gap_ || !show_cursor_ || current_addr_ == DATA_BADADDR || !data_source_) {
         painter.drawImage(content.topLeft(), cache_image_);
+        return;
+    }
+    
+    // Calculate cursor position in cache coordinates
+    const int cursor_cache_y = data_source_->address_to_y(current_addr_, cache_image_.height());
+    if (cursor_cache_y < 0 || cursor_cache_y >= cache_image_.height()) {
+        // Cursor outside viewport, draw normally
+        painter.drawImage(content.topLeft(), cache_image_);
+        return;
+    }
+    
+    // Gap parameters
+    const int gap_height = QT_CURSOR_GAP_HEIGHT;
+    const int half_gap = gap_height / 2;
+    
+    // Calculate screen position for the gap center (proportional to cursor position)
+    const double cursor_frac = static_cast<double>(cursor_cache_y) / cache_image_.height();
+    const int gap_center_y = static_cast<int>(cursor_frac * content.height());
+    
+    // Clamp gap position to ensure it's visible
+    const int gap_top = std::max(half_gap, std::min(content.height() - half_gap, gap_center_y)) - half_gap;
+    const int gap_bottom = gap_top + gap_height;
+    
+    // Draw top portion (cache[0..cursor_cache_y] -> screen[0..gap_top])
+    if (cursor_cache_y > 0 && gap_top > 0) {
+        QRect src_top(0, 0, cache_image_.width(), cursor_cache_y);
+        QRect dst_top(content.left(), content.top(), content.width(), gap_top);
+        painter.drawImage(dst_top, cache_image_, src_top);
+    }
+    
+    // Draw bottom portion (cache[cursor_cache_y..end] -> screen[gap_bottom..end])
+    const int cache_bottom_height = cache_image_.height() - cursor_cache_y;
+    const int screen_bottom_height = content.height() - gap_bottom;
+    if (cache_bottom_height > 0 && screen_bottom_height > 0) {
+        QRect src_bottom(0, cursor_cache_y, cache_image_.width(), cache_bottom_height);
+        QRect dst_bottom(content.left(), content.top() + gap_bottom, content.width(), screen_bottom_height);
+        painter.drawImage(dst_bottom, cache_image_, src_bottom);
     }
 }
 
@@ -353,14 +463,27 @@ void MinimapWidget::drawRegions(QPainter& painter) {
 }
 
 void MinimapWidget::drawCursor(QPainter& painter) {
-    if (!show_cursor_ || current_addr_ == DATA_BADADDR) {
+    if (!show_cursor_ || current_addr_ == DATA_BADADDR || !data_source_) {
         return;
     }
     
-    const int pos = addressToPosition(current_addr_);
-    if (pos < 0) return;
-    
     const QRect content = contentRect();
+    
+    // Calculate cursor position with gap effect
+    const int cursor_cache_y = data_source_->address_to_y(current_addr_, cache_image_.height());
+    if (cursor_cache_y < 0 || cursor_cache_y >= cache_image_.height()) {
+        return;
+    }
+    
+    // Calculate gap position (must match drawContent logic)
+    const int gap_height = show_cursor_gap_ ? QT_CURSOR_GAP_HEIGHT : 0;
+    const int half_gap = gap_height / 2;
+    const double cursor_frac = static_cast<double>(cursor_cache_y) / cache_image_.height();
+    const int gap_center_y = static_cast<int>(cursor_frac * content.height());
+    const int gap_top = std::max(half_gap, std::min(content.height() - half_gap, gap_center_y)) - half_gap;
+    
+    // Draw the cursor line in the center of the gap
+    const int line_y = content.top() + gap_top + half_gap;
     
     QPen pen(QColor(colors::CursorLine.r, colors::CursorLine.g, 
                     colors::CursorLine.b, colors::CursorLine.a));
@@ -368,9 +491,11 @@ void MinimapWidget::drawCursor(QPainter& painter) {
     painter.setPen(pen);
     
     if (vertical_layout_) {
-        painter.drawLine(content.left(), pos, content.right(), pos);
+        painter.drawLine(content.left(), line_y, content.right(), line_y);
     } else {
-        painter.drawLine(pos, content.top(), pos, content.bottom());
+        // For horizontal layout, would need similar treatment
+        const int line_x = content.left() + gap_top + half_gap;
+        painter.drawLine(line_x, content.top(), line_x, content.bottom());
     }
 }
 
@@ -395,56 +520,37 @@ void MinimapWidget::drawHover(QPainter& painter) {
     }
 }
 
-void MinimapWidget::drawViewportFrame(QPainter& painter) {
-    if (!show_viewport_frame_ || !data_source_ || !data_source_->is_valid()) {
-        return;
-    }
+void MinimapWidget::drawCursorGap(QPainter& painter) {
+    // The cursor gap is already handled in drawContent() by splitting the image
+    // This function draws the gap background between the split portions
     
-    if (visible_start_ == DATA_BADADDR || visible_end_ == DATA_BADADDR) {
+    if (!show_cursor_gap_ || !show_cursor_ || current_addr_ == DATA_BADADDR || !data_source_) {
         return;
     }
     
     const QRect content = contentRect();
     
-    // Calculate positions for the visible range
-    const int start_pos = addressToPosition(visible_start_);
-    const int end_pos = addressToPosition(visible_end_);
-    
-    if (start_pos < 0 && end_pos < 0) {
+    if (cache_image_.isNull() || cache_image_.height() == 0) {
         return;
     }
     
-    QRect frame_rect;
-    if (vertical_layout_) {
-        const int y1 = std::max(content.top(), start_pos);
-        const int y2 = std::min(content.bottom(), end_pos);
-        if (y2 > y1) {
-            frame_rect = QRect(content.left(), y1, content.width(), y2 - y1);
-        }
-    } else {
-        const int x1 = std::max(content.left(), start_pos);
-        const int x2 = std::min(content.right(), end_pos);
-        if (x2 > x1) {
-            frame_rect = QRect(x1, content.top(), x2 - x1, content.height());
-        }
-    }
-    
-    if (frame_rect.isEmpty()) {
+    // Calculate cursor position (must match drawContent logic)
+    const int cursor_cache_y = data_source_->address_to_y(current_addr_, cache_image_.height());
+    if (cursor_cache_y < 0 || cursor_cache_y >= cache_image_.height()) {
         return;
     }
     
-    // Draw semi-transparent fill
-    painter.fillRect(frame_rect, QColor(
-        colors::ViewportFrame.r, colors::ViewportFrame.g,
-        colors::ViewportFrame.b, colors::ViewportFrame.a
+    const int gap_height = QT_CURSOR_GAP_HEIGHT;
+    const int half_gap = gap_height / 2;
+    const double cursor_frac = static_cast<double>(cursor_cache_y) / cache_image_.height();
+    const int gap_center_y = static_cast<int>(cursor_frac * content.height());
+    const int gap_top = std::max(half_gap, std::min(content.height() - half_gap, gap_center_y)) - half_gap;
+    
+    // Fill the gap with background color
+    QRect gap_rect(content.left(), content.top() + gap_top, content.width(), gap_height);
+    painter.fillRect(gap_rect, QColor(
+        colors::Background.r, colors::Background.g, colors::Background.b
     ));
-    
-    // Draw border
-    QPen pen(QColor(colors::ViewportFrameBorder.r, colors::ViewportFrameBorder.g,
-                    colors::ViewportFrameBorder.b, colors::ViewportFrameBorder.a));
-    pen.setWidth(1);
-    painter.setPen(pen);
-    painter.drawRect(frame_rect.adjusted(0, 0, -1, -1));
 }
 
 void MinimapWidget::paintEvent(QPaintEvent* event) {
@@ -463,9 +569,9 @@ void MinimapWidget::paintEvent(QPaintEvent* event) {
     
     // Draw overlays (order matters for visibility)
     drawRegions(painter);       // Faint segment separators
-    drawViewportFrame(painter); // IDA visible range frame
+    drawCursorGap(painter);     // Gap background at cursor position
     drawHover(painter);         // Hover highlight
-    drawCursor(painter);        // Current cursor position
+    drawCursor(painter);        // Current cursor position line
     
     // Draw border
     painter.setPen(QColor(64, 64, 64));
@@ -482,7 +588,10 @@ void MinimapWidget::mousePressEvent(QMouseEvent* event) {
             drag_start_ = event->pos();
             drag_start_addr_ = addr;
             
-            // Also navigate on click
+            // Update cursor position immediately (don't wait for IDA event)
+            setCurrentAddress(addr);
+            
+            // Also navigate IDA to this address
             if (onAddressClicked) {
                 onAddressClicked(addr);
             }
@@ -496,13 +605,18 @@ void MinimapWidget::mouseMoveEvent(QMouseEvent* event) {
     const data_addr_t addr = positionToAddress(event->pos());
     
     if (is_dragging_) {
-        // Continuously navigate to address while dragging
-        if (addr != DATA_BADADDR && onAddressClicked) {
-            onAddressClicked(addr);
+        // Update cursor position immediately while dragging
+        if (addr != DATA_BADADDR) {
+            setCurrentAddress(addr);
+            
+            // Also navigate IDA to this address
+            if (onAddressClicked) {
+                onAddressClicked(addr);
+            }
         }
         // Update hover state during drag too
         hover_addr_ = addr;
-        update();
+        // Note: setCurrentAddress already calls update()
     } else {
         // Update hover state
         hover_addr_ = addr;
@@ -511,9 +625,9 @@ void MinimapWidget::mouseMoveEvent(QMouseEvent* event) {
             onAddressHovered(addr);
         }
         
-        // Show tooltip with address, segment, and entropy info
+        // Show tooltip with address, segment, and JS divergence info
         if (addr != DATA_BADADDR && data_source_) {
-            const double entropy = data_source_->entropy_at(addr);
+            const double js_value = data_source_->entropy_at(addr);
             const std::string segment_name = data_source_->get_region_name(addr);
             
             QString tooltip = QString("Address: 0x%1").arg(addr, 0, 16);
@@ -522,8 +636,8 @@ void MinimapWidget::mouseMoveEvent(QMouseEvent* event) {
                 tooltip += QString("\nSegment: %1").arg(QString::fromStdString(segment_name));
             }
             
-            if (entropy >= 0.0) {
-                tooltip += QString("\nEntropy: %1").arg(entropy, 0, 'f', 2);
+            if (js_value >= 0.0) {
+                tooltip += QString("\nJS Divergence: %1").arg(js_value, 0, 'f', 2);
             }
             
             QToolTip::showText(event->globalPosition().toPoint(), tooltip, this);

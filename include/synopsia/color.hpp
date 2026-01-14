@@ -147,8 +147,6 @@ inline constexpr Color RegionBorder{0, 0, 0, 255};             ///< Black segmen
 inline constexpr Color RegionText{220, 220, 220, 255};         ///< Segment name text color (brighter)
 inline constexpr Color RegionTextBg{0, 0, 0, 180};             ///< Semi-transparent background for segment text
 inline constexpr Color HoverHighlight{255, 255, 255, 64};
-inline constexpr Color ViewportFrame{200, 200, 200, 80};       ///< Semi-transparent viewport frame fill
-inline constexpr Color ViewportFrameBorder{255, 255, 255, 120}; ///< Viewport frame border
 
 } // namespace colors
 

@@ -85,13 +85,6 @@ void synopsia_configure_widget(void* minimap_widget, bool show_cursor,
     widget->setVerticalLayout(vertical_layout);
 }
 
-/// Set the visible range for the viewport frame
-void synopsia_set_visible_range(void* minimap_widget, std::uint64_t start, std::uint64_t end) {
-    synopsia::MinimapWidget* widget = 
-        reinterpret_cast<synopsia::MinimapWidget*>(minimap_widget);
-    widget->setVisibleRange(start, end);
-}
-
 } // extern "C"
 
 #endif // SYNOPSIA_USE_QT

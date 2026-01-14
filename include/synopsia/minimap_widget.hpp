@@ -32,9 +32,10 @@
 namespace synopsia {
 
 // Visual configuration constants (Qt-local, no IDA dependency)
-inline constexpr int QT_DEFAULT_MINIMAP_WIDTH = 180;  // Default width when docked
-inline constexpr int QT_MIN_MINIMAP_WIDTH = 80;
+inline constexpr int QT_DEFAULT_MINIMAP_WIDTH = 90;   // Default width when docked
+inline constexpr int QT_MIN_MINIMAP_WIDTH = 60;
 inline constexpr int QT_CURSOR_LINE_HEIGHT = 2;
+inline constexpr int QT_CURSOR_GAP_HEIGHT = 8;        // Gap height for cursor "push" effect
 inline constexpr int QT_MINIMAP_MARGIN = 4;
 
 /// Callback types (using interface types)
@@ -104,13 +105,9 @@ public:
     /// @brief Get the current highlighted address
     [[nodiscard]] data_addr_t currentAddress() const noexcept { return current_addr_; }
     
-    /// @brief Set the visible range in IDA's view (for viewport frame)
-    /// This draws a "frame" on the minimap showing what's currently visible
-    /// in the IDA disassembly view, similar to VSCode's minimap
-    void setVisibleRange(data_addr_t start, data_addr_t end);
-    
-    /// @brief Enable/disable the viewport frame
-    void setShowViewportFrame(bool show);
+    /// @brief Enable/disable the cursor gap effect
+    /// When enabled, the minimap content is pushed apart at the cursor position
+    void setShowCursorGap(bool show);
     
     // =========================================================================
     // Callbacks (replaces Qt signals to avoid moc)
@@ -166,8 +163,8 @@ private:
     /// Draw hover highlight
     void drawHover(QPainter& painter);
     
-    /// Draw viewport frame (shows IDA's visible range)
-    void drawViewportFrame(QPainter& painter);
+    /// Draw cursor gap (split effect at cursor position)
+    void drawCursorGap(QPainter& painter);
     
     // =========================================================================
     // Coordinate Helpers
@@ -193,10 +190,8 @@ private:
     bool vertical_layout_ = true;
     bool show_cursor_ = true;
     bool show_regions_ = true;
-    bool show_viewport_frame_ = true;
+    bool show_cursor_gap_ = true;
     data_addr_t current_addr_ = DATA_BADADDR;
-    data_addr_t visible_start_ = DATA_BADADDR;
-    data_addr_t visible_end_ = DATA_BADADDR;
     
     // Interaction state
     bool is_hovering_ = false;

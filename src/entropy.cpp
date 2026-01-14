@@ -1,5 +1,5 @@
 /// @file entropy.cpp
-/// @brief Shannon entropy calculation implementation
+/// @brief Jensen-Shannon divergence calculation implementation
 
 #include <synopsia/entropy.hpp>
 

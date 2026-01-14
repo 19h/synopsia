@@ -17,7 +17,6 @@ extern "C" {
     void synopsia_set_current_address(void* minimap_widget, std::uint64_t addr);
     void synopsia_configure_widget(void* minimap_widget, bool show_cursor, 
                                    bool show_regions, bool vertical_layout);
-    void synopsia_set_visible_range(void* minimap_widget, std::uint64_t start, std::uint64_t end);
 }
 #endif
 
@@ -221,12 +220,12 @@ bool SynopsiaPlugin::create_widget() {
     synopsia_set_address_callback(content_, address_click_callback);
     synopsia_set_refresh_callback(content_, refresh_callback);
     
-    // Display the widget docked to the right side
+    // Display the widget docked to the right side at the top level
     // Use SZHINT to respect the widget's sizeHint() for initial sizing
     display_widget(widget_, WOPN_DP_RIGHT | WOPN_DP_SZHINT | WOPN_PERSIST);
     
-    // Explicitly set dock position to the right of the main IDA view
-    set_dock_pos(WIDGET_TITLE, "IDA View-A", DP_RIGHT | DP_SZHINT);
+    // Dock to the right of the entire window (nullptr = top level)
+    set_dock_pos(WIDGET_TITLE, nullptr, DP_RIGHT | DP_SZHINT);
     
     return true;
 #else
@@ -302,24 +301,6 @@ void SynopsiaPlugin::on_cursor_changed(ea_t addr) {
         if (config_.show_cursor) {
             synopsia_set_current_address(content_, static_cast<std::uint64_t>(addr));
         }
-        
-        // Update visible range for viewport frame
-        // Estimate visible range as ~2KB around cursor (typical view shows ~50-100 lines)
-        // This could be improved by querying the actual view state
-        constexpr ea_t VISIBLE_RANGE_ESTIMATE = 0x800; // 2KB
-        ea_t vis_start = (addr > VISIBLE_RANGE_ESTIMATE) ? addr - VISIBLE_RANGE_ESTIMATE : 0;
-        ea_t vis_end = addr + VISIBLE_RANGE_ESTIMATE;
-        
-        // Clamp to database range
-        if (data_ && data_->is_valid()) {
-            auto [db_start, db_end] = data_->address_range();
-            vis_start = std::max(vis_start, db_start);
-            vis_end = std::min(vis_end, db_end);
-        }
-        
-        synopsia_set_visible_range(content_, 
-            static_cast<std::uint64_t>(vis_start),
-            static_cast<std::uint64_t>(vis_end));
     }
 #endif
 }

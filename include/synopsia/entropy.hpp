@@ -1,5 +1,5 @@
 /// @file entropy.hpp
-/// @brief Shannon entropy calculation engine
+/// @brief Jensen-Shannon divergence calculation engine
 
 #pragma once
 
@@ -10,23 +10,25 @@
 namespace synopsia {
 
 /// @class EntropyCalculator
-/// @brief Calculates Shannon entropy for binary data blocks
+/// @brief Calculates Jensen-Shannon divergence for binary data blocks
 ///
-/// Shannon entropy measures the amount of randomness/information in data.
-/// - Low entropy (0-4): Repetitive patterns, zeros, simple data
-/// - Medium entropy (4-7): Code, structured data
-/// - High entropy (7-8): Encrypted, compressed, or random data
+/// JS divergence measures how different the byte distribution is from uniform.
+/// We compare the observed distribution P against uniform distribution Q (1/256).
+/// Result is scaled to 0-8 range for compatibility with entropy visualization:
+/// - Low value (0-4): Repetitive patterns, zeros, simple data (high JS divergence)
+/// - Medium value (4-7): Code, structured data
+/// - High value (7-8): Random/uniform data (low JS divergence from uniform)
 class EntropyCalculator {
 public:
-    /// @brief Calculate Shannon entropy for a data buffer
+    /// @brief Calculate JS divergence for a data buffer (scaled to 0-8)
     /// @param data Pointer to data buffer
     /// @param size Size of data buffer in bytes
-    /// @return Entropy value in bits (0.0 to 8.0)
+    /// @return Scaled JS divergence value (0.0 to 8.0), where 8 = uniform/random
     [[nodiscard]] static double calculate(const void* data, std::size_t size);
     
-    /// @brief Calculate entropy for a span of bytes
+    /// @brief Calculate JS divergence for a span of bytes
     /// @param data Span of byte data
-    /// @return Entropy value in bits (0.0 to 8.0)
+    /// @return Scaled JS divergence value (0.0 to 8.0)
     [[nodiscard]] static double calculate(std::span<const std::uint8_t> data);
     
     /// @brief Analyze entire database and compute entropy blocks
@@ -92,20 +94,43 @@ inline double EntropyCalculator::calculate(const void* data, std::size_t size) {
         ++frequency[bytes[i]];
     }
     
-    // Calculate Shannon entropy: H = -sum(p * log2(p))
-    double entropy = 0.0;
+    // Calculate Jensen-Shannon divergence between observed distribution P
+    // and uniform distribution Q (1/256 for each byte value)
+    //
+    // JS(P || Q) = 0.5 * KL(P || M) + 0.5 * KL(Q || M)
+    // where M = 0.5 * (P + Q)
+    //
+    // KL(P || Q) = sum(P(x) * log2(P(x) / Q(x)))
     
-    for (std::size_t count : frequency) {
-        if (count > 0) {
-            // p = count / size
-            // p * log2(p) = (count/size) * log2(count/size)
-            //             = (count/size) * (log2(count) - log2(size))
-            const double p = static_cast<double>(count) / static_cast<double>(size);
-            entropy -= p * std::log2(p);
+    constexpr double uniform_prob = 1.0 / 256.0;  // Q(x) = 1/256 for all x
+    const double size_d = static_cast<double>(size);
+    
+    double kl_p_m = 0.0;  // KL(P || M)
+    double kl_q_m = 0.0;  // KL(Q || M)
+    
+    for (std::size_t i = 0; i < 256; ++i) {
+        const double p = static_cast<double>(frequency[i]) / size_d;  // P(x)
+        const double q = uniform_prob;                                  // Q(x)
+        const double m = 0.5 * (p + q);                                // M(x)
+        
+        // KL(P || M): sum over x where P(x) > 0
+        if (p > 0.0 && m > 0.0) {
+            kl_p_m += p * std::log2(p / m);
+        }
+        
+        // KL(Q || M): Q is always > 0 (uniform), so always contribute
+        if (m > 0.0) {
+            kl_q_m += q * std::log2(q / m);
         }
     }
     
-    return entropy;
+    // JS divergence (bounded 0 to 1)
+    const double js_divergence = 0.5 * kl_p_m + 0.5 * kl_q_m;
+    
+    // Scale to 0-8 range, inverted so that:
+    // - High value (8) = uniform/random (low JS divergence from uniform)
+    // - Low value (0) = structured/repetitive (high JS divergence from uniform)
+    return (1.0 - js_divergence) * 8.0;
 }
 
 inline double EntropyCalculator::calculate(std::span<const std::uint8_t> data) {

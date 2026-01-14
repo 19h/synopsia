@@ -29,19 +29,19 @@ namespace synopsia {
 
 inline constexpr const char* PLUGIN_NAME = "Synopsia";
 inline constexpr const char* PLUGIN_VERSION = "1.0.0";
-inline constexpr const char* PLUGIN_COMMENT = "Entropy-based binary minimap";
-inline constexpr const char* PLUGIN_HELP = "Visual entropy analysis with click-to-navigate";
+inline constexpr const char* PLUGIN_COMMENT = "JS divergence binary minimap";
+inline constexpr const char* PLUGIN_HELP = "Visual JS divergence analysis with click-to-navigate";
 inline constexpr const char* DEFAULT_HOTKEY = "Alt+E";
 
 inline constexpr const char* ACTION_NAME = "synopsia:show_minimap";
-inline constexpr const char* ACTION_LABEL = "Show Entropy Minimap";
-inline constexpr const char* WIDGET_TITLE = "Entropy Minimap";
+inline constexpr const char* ACTION_LABEL = "Show JS Minimap";
+inline constexpr const char* WIDGET_TITLE = "JS Minimap";
 
 // =============================================================================
-// Entropy Configuration
+// JS Divergence Configuration
 // =============================================================================
 
-/// Default block size for entropy calculation (bytes)
+/// Default block size for JS divergence calculation (bytes)
 inline constexpr std::size_t DEFAULT_BLOCK_SIZE = 256;
 
 /// Minimum block size allowed
@@ -50,13 +50,13 @@ inline constexpr std::size_t MIN_BLOCK_SIZE = 16;
 /// Maximum block size allowed
 inline constexpr std::size_t MAX_BLOCK_SIZE = 4096;
 
-/// Shannon entropy maximum value (8 bits per byte = 8.0)
+/// Maximum JS divergence value (scaled to 8.0 for visualization compatibility)
 inline constexpr double MAX_ENTROPY = 8.0;
 
-/// Entropy threshold for "high entropy" (typically encrypted/compressed)
+/// Threshold for "high randomness" (close to uniform distribution)
 inline constexpr double HIGH_ENTROPY_THRESHOLD = 7.0;
 
-/// Entropy threshold for "low entropy" (typically code/data)
+/// Threshold for "low randomness" (structured/repetitive data)
 inline constexpr double LOW_ENTROPY_THRESHOLD = 4.0;
 
 // =============================================================================
