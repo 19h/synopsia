@@ -48,6 +48,18 @@ public:
     /// Get disassembly for function at address
     [[nodiscard]] virtual std::string get_disassembly(func_addr_t address) const = 0;
 
+    /// Get decompiled pseudocode for function at address (requires Hex-Rays)
+    [[nodiscard]] virtual std::string get_decompilation(func_addr_t address) const = 0;
+
+    /// Check if decompiler is available
+    [[nodiscard]] virtual bool has_decompiler() const = 0;
+
+    /// Find function by name (returns FUNC_BADADDR if not found)
+    [[nodiscard]] virtual func_addr_t find_function_by_name(const std::string& name) const = 0;
+
+    /// Find function containing address (returns FUNC_BADADDR if not in any function)
+    [[nodiscard]] virtual func_addr_t find_function_at(func_addr_t address) const = 0;
+
     /// Refresh function list from database
     virtual bool refresh() = 0;
 };

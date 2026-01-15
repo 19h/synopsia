@@ -26,6 +26,12 @@
 
 #include <cstdio>
 
+// Forward declarations for navigation functions
+extern "C" {
+    void synopsia_function_search_navigate_back();
+    void synopsia_function_search_navigate_forward();
+}
+
 namespace {
 
 // =============================================================================
@@ -249,6 +255,15 @@ private:
         switch (event->type()) {
             case QEvent::MouseButtonPress: {
                 auto* e = static_cast<QMouseEvent*>(event);
+                // Handle mouse back/forward buttons for navigation
+                if (e->button() == Qt::BackButton) {
+                    synopsia_function_search_navigate_back();
+                    break;
+                }
+                if (e->button() == Qt::ForwardButton) {
+                    synopsia_function_search_navigate_forward();
+                    break;
+                }
                 int button = qt_mouse_button_to_imgui(e->button());
                 if (button >= 0) {
                     io.AddMouseButtonEvent(button, true);

@@ -7,13 +7,27 @@
 #include <lines.hpp>
 #include <bytes.hpp>
 #include <ua.hpp>
+#include <hexrays.hpp>
 
 namespace synopsia {
 namespace features {
 namespace function_search {
 
+// Check if Hex-Rays is available (cached)
+static bool g_hexrays_checked = false;
+static bool g_hexrays_available = false;
+
+static bool check_hexrays() {
+    if (!g_hexrays_checked) {
+        g_hexrays_checked = true;
+        g_hexrays_available = init_hexrays_plugin();
+    }
+    return g_hexrays_available;
+}
+
 bool FunctionData::refresh() {
     functions_.clear();
+    name_to_addr_.clear();
 
     if (!is_database_loaded()) {
         valid_ = false;
@@ -26,6 +40,7 @@ bool FunctionData::refresh() {
         ++count;
     }
     functions_.reserve(count);
+    name_to_addr_.reserve(count);
 
     // Iterate over all functions
     for (std::size_t i = 0; i < get_func_qty(); ++i) {
@@ -49,11 +64,76 @@ bool FunctionData::refresh() {
             entry.demangled_name = demangled;
         }
 
+        // Build name lookup maps
+        name_to_addr_[std::string(entry.name.c_str())] = static_cast<func_addr_t>(entry.address);
+        if (!entry.demangled_name.empty()) {
+            name_to_addr_[std::string(entry.demangled_name.c_str())] = static_cast<func_addr_t>(entry.address);
+        }
+
         functions_.push_back(std::move(entry));
     }
 
     valid_ = true;
     return true;
+}
+
+bool FunctionData::has_decompiler() const {
+    return check_hexrays();
+}
+
+func_addr_t FunctionData::find_function_by_name(const std::string& name) const {
+    auto it = name_to_addr_.find(name);
+    if (it != name_to_addr_.end()) {
+        return it->second;
+    }
+    return FUNC_BADADDR;
+}
+
+func_addr_t FunctionData::find_function_at(func_addr_t address) const {
+    func_t* func = get_func(static_cast<ea_t>(address));
+    if (func) {
+        return static_cast<func_addr_t>(func->start_ea);
+    }
+    return FUNC_BADADDR;
+}
+
+std::string FunctionData::get_decompilation(func_addr_t address) const {
+    if (!check_hexrays()) {
+        return "// Hex-Rays decompiler not available";
+    }
+
+    func_t* func = get_func(static_cast<ea_t>(address));
+    if (!func) {
+        return "// Function not found";
+    }
+
+    // Decompile the function
+    hexrays_failure_t hf;
+    cfuncptr_t cfunc = decompile(func, &hf, DECOMP_WARNINGS);
+
+    if (!cfunc) {
+        std::string error = "// Decompilation failed";
+        if (!hf.desc().empty()) {
+            error += ": ";
+            error += hf.desc().c_str();
+        }
+        return error;
+    }
+
+    // Get the pseudocode as text
+    const strvec_t& sv = cfunc->get_pseudocode();
+
+    std::string result;
+    result.reserve(sv.size() * 80);
+
+    for (const auto& line : sv) {
+        qstring clean_line;
+        tag_remove(&clean_line, line.line);
+        result += clean_line.c_str();
+        result += "\n";
+    }
+
+    return result.empty() ? "// Empty decompilation" : result;
 }
 
 std::string FunctionData::get_disassembly(func_addr_t address) const {

@@ -5,6 +5,7 @@
 
 #include "data_interface.hpp"
 #include <synopsia/common/types.hpp>
+#include <unordered_map>
 
 namespace synopsia {
 namespace features {
@@ -28,6 +29,10 @@ public:
     [[nodiscard]] std::size_t function_count() const override { return functions_.size(); }
     [[nodiscard]] FunctionInfo get_function(std::size_t index) const override;
     [[nodiscard]] std::string get_disassembly(func_addr_t address) const override;
+    [[nodiscard]] std::string get_decompilation(func_addr_t address) const override;
+    [[nodiscard]] bool has_decompiler() const override;
+    [[nodiscard]] func_addr_t find_function_by_name(const std::string& name) const override;
+    [[nodiscard]] func_addr_t find_function_at(func_addr_t address) const override;
     bool refresh() override;
 
 private:
@@ -38,6 +43,7 @@ private:
     };
 
     std::vector<FunctionEntry> functions_;
+    std::unordered_map<std::string, func_addr_t> name_to_addr_;
     bool valid_ = false;
 };
 

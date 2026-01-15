@@ -5,6 +5,7 @@
 #include <synopsia/common/types.hpp>
 #include <synopsia/features/entropy_minimap/feature.hpp>
 #include <synopsia/features/function_search/feature.hpp>
+#include <synopsia/features/binary_map_3d/feature.hpp>
 
 namespace synopsia {
 
@@ -58,6 +59,7 @@ bool SynopsiaPlugin::initialize() {
     // Register features
     registry_.register_feature(std::make_unique<features::EntropyMinimapFeature>());
     registry_.register_feature(std::make_unique<features::FunctionSearchFeature>());
+    registry_.register_feature(std::make_unique<features::BinaryMap3DFeature>());
 
     // Initialize all features
     std::size_t count = registry_.initialize_all();

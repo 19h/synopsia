@@ -312,6 +312,13 @@ set(SYNOPSIA_FUNCTION_SEARCH_SOURCES
     src/features/function_search/feature.cpp
 )
 
+# 3D Binary Map feature (ImGui-based, 3D visualization)
+set(SYNOPSIA_BINARY_MAP_3D_SOURCES
+    src/features/binary_map_3d/map_data.cpp
+    src/features/binary_map_3d/imgui_widget.cpp
+    src/features/binary_map_3d/feature.cpp
+)
+
 # ImGui integration layer (Qt-OpenGL-ImGui bridge)
 set(SYNOPSIA_IMGUI_SOURCES
     src/imgui/qt_imgui_widget.cpp
@@ -323,6 +330,7 @@ set(SYNOPSIA_SOURCES
     ${SYNOPSIA_COMMON_SOURCES}
     ${SYNOPSIA_ENTROPY_SOURCES}
     ${SYNOPSIA_FUNCTION_SEARCH_SOURCES}
+    ${SYNOPSIA_BINARY_MAP_3D_SOURCES}
     ${SYNOPSIA_IMGUI_SOURCES}
     ${IMGUI_SOURCES}
     ${IMGUI_COLOR_TEXT_EDIT_SOURCES}
@@ -351,6 +359,9 @@ set(SYNOPSIA_HEADERS
     include/synopsia/features/function_search/function_data.hpp
     include/synopsia/features/function_search/search_widget.hpp
     include/synopsia/features/function_search/feature.hpp
+    # 3D Binary Map feature
+    include/synopsia/features/binary_map_3d/map_data.hpp
+    include/synopsia/features/binary_map_3d/feature.hpp
 )
 
 # =============================================================================
