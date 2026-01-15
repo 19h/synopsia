@@ -6,6 +6,44 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+include(FetchContent)
+
+# =============================================================================
+# Dear ImGui (GPU-accelerated immediate mode GUI)
+# =============================================================================
+
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.91.6
+)
+FetchContent_MakeAvailable(imgui)
+
+# ImGui core sources
+set(IMGUI_SOURCES
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+)
+
+# =============================================================================
+# ImGuiColorTextEdit (syntax highlighting text editor)
+# =============================================================================
+
+FetchContent_Declare(
+    imgui_color_text_edit
+    GIT_REPOSITORY https://github.com/BalazsJako/ImGuiColorTextEdit.git
+    GIT_TAG master
+)
+FetchContent_MakeAvailable(imgui_color_text_edit)
+
+set(IMGUI_COLOR_TEXT_EDIT_SOURCES
+    ${imgui_color_text_edit_SOURCE_DIR}/TextEditor.cpp
+)
+
 # =============================================================================
 # Build Configuration
 # =============================================================================
@@ -97,6 +135,19 @@ else()
 endif()
 
 # =============================================================================
+# OpenGL (for ImGui GPU rendering)
+# =============================================================================
+
+find_package(OpenGL REQUIRED)
+
+if(APPLE)
+    # macOS uses Metal-backed OpenGL
+    find_library(COCOA_LIBRARY Cocoa REQUIRED)
+    find_library(IOKIT_LIBRARY IOKit REQUIRED)
+    find_library(COREVIDEO_LIBRARY CoreVideo REQUIRED)
+endif()
+
+# =============================================================================
 # IDA SDK Paths
 # =============================================================================
 
@@ -150,16 +201,18 @@ if(APPLE AND NOT IDA_INSTALL_DIR)
 endif()
 
 # Find Qt for headers (we won't link against it)
-find_package(Qt6 COMPONENTS Core Gui Widgets QUIET)
+find_package(Qt6 COMPONENTS Core Gui Widgets OpenGL OpenGLWidgets QUIET)
 if(Qt6_FOUND)
     message(STATUS "Found Qt6 ${Qt6_VERSION} (using headers only, not linking)")
-    
+
     # Get include directories from Qt targets
     get_target_property(QT_CORE_INCLUDES Qt6::Core INTERFACE_INCLUDE_DIRECTORIES)
     get_target_property(QT_GUI_INCLUDES Qt6::Gui INTERFACE_INCLUDE_DIRECTORIES)
     get_target_property(QT_WIDGETS_INCLUDES Qt6::Widgets INTERFACE_INCLUDE_DIRECTORIES)
-    
-    set(QT_INCLUDE_DIRS ${QT_CORE_INCLUDES} ${QT_GUI_INCLUDES} ${QT_WIDGETS_INCLUDES})
+    get_target_property(QT_OPENGL_INCLUDES Qt6::OpenGL INTERFACE_INCLUDE_DIRECTORIES)
+    get_target_property(QT_OPENGLWIDGETS_INCLUDES Qt6::OpenGLWidgets INTERFACE_INCLUDE_DIRECTORIES)
+
+    set(QT_INCLUDE_DIRS ${QT_CORE_INCLUDES} ${QT_GUI_INCLUDES} ${QT_WIDGETS_INCLUDES} ${QT_OPENGL_INCLUDES} ${QT_OPENGLWIDGETS_INCLUDES})
     set(QT_FOUND TRUE)
     set(QT_HEADERS_ONLY TRUE)
     
@@ -231,23 +284,73 @@ endif()
 # Source Files
 # =============================================================================
 
-set(SYNOPSIA_SOURCES
-    src/entropy.cpp
+# Core infrastructure
+set(SYNOPSIA_CORE_SOURCES
+    src/core/plugin.cpp
+    src/core/feature_registry.cpp
+)
+
+# Common utilities (reused existing files in-place)
+set(SYNOPSIA_COMMON_SOURCES
     src/color.cpp
+    src/qt_compat.cpp
+)
+
+# Entropy minimap feature (using existing code + new feature wrapper)
+set(SYNOPSIA_ENTROPY_SOURCES
+    src/entropy.cpp
     src/minimap_data.cpp
     src/minimap_widget.cpp
     src/widget_bridge.cpp
-    src/qt_compat.cpp
-    src/plugin.cpp
+    src/features/entropy_minimap/feature.cpp
 )
 
+# Function search feature (ImGui-based, GPU accelerated)
+set(SYNOPSIA_FUNCTION_SEARCH_SOURCES
+    src/features/function_search/function_data.cpp
+    src/features/function_search/imgui_widget.cpp
+    src/features/function_search/feature.cpp
+)
+
+# ImGui integration layer (Qt-OpenGL-ImGui bridge)
+set(SYNOPSIA_IMGUI_SOURCES
+    src/imgui/qt_imgui_widget.cpp
+)
+
+# All sources combined
+set(SYNOPSIA_SOURCES
+    ${SYNOPSIA_CORE_SOURCES}
+    ${SYNOPSIA_COMMON_SOURCES}
+    ${SYNOPSIA_ENTROPY_SOURCES}
+    ${SYNOPSIA_FUNCTION_SEARCH_SOURCES}
+    ${SYNOPSIA_IMGUI_SOURCES}
+    ${IMGUI_SOURCES}
+    ${IMGUI_COLOR_TEXT_EDIT_SOURCES}
+)
+
+# Headers (for IDE support)
 set(SYNOPSIA_HEADERS
+    # Core
+    include/synopsia/core/feature_base.hpp
+    include/synopsia/core/feature_registry.hpp
+    # Common
+    include/synopsia/common/types.hpp
+    include/synopsia/common/color.hpp
+    # Legacy (still used by existing code)
     include/synopsia/types.hpp
     include/synopsia/entropy.hpp
     include/synopsia/color.hpp
     include/synopsia/minimap_data.hpp
+    include/synopsia/minimap_data_interface.hpp
     include/synopsia/minimap_widget.hpp
     include/synopsia/plugin.hpp
+    # Entropy minimap feature
+    include/synopsia/features/entropy_minimap/feature.hpp
+    # Function search feature
+    include/synopsia/features/function_search/data_interface.hpp
+    include/synopsia/features/function_search/function_data.hpp
+    include/synopsia/features/function_search/search_widget.hpp
+    include/synopsia/features/function_search/feature.hpp
 )
 
 # =============================================================================
@@ -259,10 +362,31 @@ add_library(synopsia${IDA_SUFFIX} SHARED ${SYNOPSIA_SOURCES} ${SYNOPSIA_HEADERS}
 target_include_directories(synopsia${IDA_SUFFIX} PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${IDA_INCLUDE_DIR}
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+    ${imgui_color_text_edit_SOURCE_DIR}
 )
+
+# ImGui OpenGL3 backend configuration
+# Let ImGui auto-detect the OpenGL loader, but silence deprecation on macOS
+if(APPLE)
+    target_compile_definitions(synopsia${IDA_SUFFIX} PRIVATE
+        GL_SILENCE_DEPRECATION
+    )
+endif()
 
 if(IDA_LIB)
     target_link_libraries(synopsia${IDA_SUFFIX} PRIVATE ${IDA_LIB})
+endif()
+
+# OpenGL linking
+target_link_libraries(synopsia${IDA_SUFFIX} PRIVATE OpenGL::GL)
+if(APPLE)
+    target_link_libraries(synopsia${IDA_SUFFIX} PRIVATE
+        ${COCOA_LIBRARY}
+        ${IOKIT_LIBRARY}
+        ${COREVIDEO_LIBRARY}
+    )
 endif()
 
 if(QT_FOUND)
@@ -298,6 +422,8 @@ if(QT_FOUND)
             "${IDA_QT_DIR}/QtWidgets.framework/Versions/A/QtWidgets"
             "${IDA_QT_DIR}/QtGui.framework/Versions/A/QtGui"
             "${IDA_QT_DIR}/QtCore.framework/Versions/A/QtCore"
+            "${IDA_QT_DIR}/QtOpenGL.framework/Versions/A/QtOpenGL"
+            "${IDA_QT_DIR}/QtOpenGLWidgets.framework/Versions/A/QtOpenGLWidgets"
         )
         target_link_libraries(synopsia${IDA_SUFFIX} PRIVATE ida_qt_link)
         

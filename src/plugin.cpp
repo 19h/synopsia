@@ -10,7 +10,7 @@
 // Forward declarations for bridge functions (defined in widget_bridge.cpp)
 extern "C" {
     void* synopsia_create_minimap_widget(void* parent_widget, void* data_source);
-    void synopsia_add_widget_to_layout(void* parent_widget, void* minimap_widget);
+    void synopsia_add_minimap_to_layout(void* parent_widget, void* minimap_widget);
     void synopsia_set_address_callback(void* minimap_widget, void (*callback)(std::uint64_t));
     void synopsia_set_refresh_callback(void* minimap_widget, void (*callback)());
     void synopsia_refresh_widget(void* minimap_widget);
@@ -214,7 +214,7 @@ bool SynopsiaPlugin::create_widget() {
     }
     
     // Add to layout
-    synopsia_add_widget_to_layout(widget_, content_);
+    synopsia_add_minimap_to_layout(widget_, content_);
     
     // Set up callbacks
     synopsia_set_address_callback(content_, address_click_callback);

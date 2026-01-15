@@ -25,12 +25,12 @@ void* synopsia_create_minimap_widget(void* parent_widget, void* data_source) {
     return widget;
 }
 
-/// Add the widget to the parent's layout
-void synopsia_add_widget_to_layout(void* parent_widget, void* minimap_widget) {
+/// Add the minimap widget to the parent's layout
+void synopsia_add_minimap_to_layout(void* parent_widget, void* minimap_widget) {
     QWidget* parent = reinterpret_cast<QWidget*>(parent_widget);
-    synopsia::MinimapWidget* widget = 
+    synopsia::MinimapWidget* widget =
         reinterpret_cast<synopsia::MinimapWidget*>(minimap_widget);
-    
+
     QVBoxLayout* layout = new QVBoxLayout(parent);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
