@@ -20,6 +20,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <random>
 #include <algorithm>
 #include <queue>
@@ -206,7 +207,15 @@ struct GraphNode {
 struct DAGEdgePolyline {
     ea_t from_addr;
     ea_t to_addr;
-    std::vector<Vec3> points;  // Sequence of points forming the routed edge
+    std::vector<ImVec2> points;  // Sequence of points in pixel coordinates
+};
+
+// Node rectangle for DAG flowchart layout
+struct DAGNodeRect {
+    ea_t address;
+    float x, y;           // Top-left corner in pixel coordinates
+    float width, height;  // Size in pixels
+    std::string name;
 };
 
 // =============================================================================
@@ -1227,26 +1236,37 @@ private:
     void compute_dag_flowchart_layout() {
         if (nodes_.empty()) return;
 
+        // Clear previous DAG data
+        dag_node_rects_.clear();
+        dag_edge_polylines_.clear();
+        dag_addr_to_rect_idx_.clear();
+
         // Build GraphLayout::Graph from our nodes and edges
         GraphLayout::Graph graph;
 
-        // Create blocks from nodes
+        // Create blocks from nodes - compute size based on name length
         for (const auto& node : nodes_) {
             GraphLayout::GraphBlock block;
             block.entry = static_cast<uint64_t>(node.address);
-            // Block dimensions - affects spacing calculations
-            block.width = 100;   // Reasonable default for function nodes
-            block.height = 30;
+            // Block dimensions based on text
+            int text_width = static_cast<int>(node.name.length()) * 8 + 20;  // ~8px per char + padding
+            block.width = std::max(100, std::min(text_width, 200));
+            block.height = 40;
             graph[block.entry] = block;
         }
 
-        // Add edges to source blocks
+        // Add edges to source blocks (deduplicate to avoid duplicate edges)
+        std::set<std::pair<uint64_t, uint64_t>> seen_edges;
         for (const auto& edge : edges_) {
             uint64_t from_id = static_cast<uint64_t>(edge.from);
             uint64_t to_id = static_cast<uint64_t>(edge.to);
 
             if (graph.count(from_id) && graph.count(to_id)) {
-                graph[from_id].edges.emplace_back(to_id);
+                auto edge_pair = std::make_pair(from_id, to_id);
+                if (seen_edges.insert(edge_pair).second) {
+                    // Only add if this edge hasn't been seen before
+                    graph[from_id].edges.emplace_back(to_id);
+                }
             }
         }
 
@@ -1261,46 +1281,41 @@ private:
         }
 
         // Create layout and compute
-        GraphGridLayout layout(GraphGridLayout::LayoutType::Medium);
+        // Use Wide layout type which has LP optimization disabled (Medium crashes due to bug in optimizer)
+        GraphGridLayout layout(GraphGridLayout::LayoutType::Wide);
         
         // Configure for call graph visualization
         layout.setLayoutConfig({
-            .blockVerticalSpacing = 50,
-            .blockHorizontalSpacing = 25,
-            .edgeVerticalSpacing = 8,
-            .edgeHorizontalSpacing = 8
+            .blockVerticalSpacing = 40,
+            .blockHorizontalSpacing = 20,
+            .edgeVerticalSpacing = 10,
+            .edgeHorizontalSpacing = 10
         });
 
         int canvas_width, canvas_height;
         layout.CalculateLayout(graph, entry_id, canvas_width, canvas_height);
 
-        // Store edge polylines for rendering
-        dag_edge_polylines_.clear();
-        
-        // Convert positions back to our coordinate system
-        // Scale to reasonable graph units (pixels -> units)
-        const float scale = 0.02f;  // Adjust based on typical canvas size
-        
-        // Find center for centering
-        float cx = 0, cy = 0;
-        for (const auto& [id, block] : graph) {
-            cx += block.x + block.width * 0.5f;
-            cy += block.y + block.height * 0.5f;
-        }
-        cx /= static_cast<float>(graph.size());
-        cy /= static_cast<float>(graph.size());
+        // Store canvas size for centering
+        dag_canvas_width_ = static_cast<float>(canvas_width);
+        dag_canvas_height_ = static_cast<float>(canvas_height);
 
-        // Update node positions from layout
-        for (auto& node : nodes_) {
+        // Store node rectangles in pixel coordinates
+        for (const auto& node : nodes_) {
             uint64_t id = static_cast<uint64_t>(node.address);
             auto it = graph.find(id);
             if (it != graph.end()) {
                 const auto& block = it->second;
-                // Center of block, scaled and centered
-                node.pos.x = (block.x + block.width * 0.5f - cx) * scale;
-                node.pos.y = -(block.y + block.height * 0.5f - cy) * scale;  // Flip Y
-                node.pos.z = 0.0f;
-                node.vel = Vec3(0, 0, 0);
+                
+                DAGNodeRect rect;
+                rect.address = node.address;
+                rect.x = static_cast<float>(block.x);
+                rect.y = static_cast<float>(block.y);
+                rect.width = static_cast<float>(block.width);
+                rect.height = static_cast<float>(block.height);
+                rect.name = node.name;
+                
+                dag_addr_to_rect_idx_[node.address] = dag_node_rects_.size();
+                dag_node_rects_.push_back(rect);
 
                 // Store edge polylines for this block
                 for (const auto& edge : block.edges) {
@@ -1310,15 +1325,19 @@ private:
                         poly.to_addr = static_cast<ea_t>(edge.target);
                         poly.points.reserve(edge.polyline.size());
                         for (const auto& pt : edge.polyline) {
-                            // Scale and center like node positions
-                            float px = (static_cast<float>(pt.x) - cx) * scale;
-                            float py = -(static_cast<float>(pt.y) - cy) * scale;
-                            poly.points.push_back(Vec3(px, py, 0.0f));
+                            poly.points.push_back(ImVec2(static_cast<float>(pt.x), static_cast<float>(pt.y)));
                         }
                         dag_edge_polylines_.push_back(std::move(poly));
                     }
                 }
             }
+        }
+
+        // Set positions for the regular nodes_ array (for compatibility with other code)
+        // These are just for display purposes, actual DAG rendering uses dag_node_rects_
+        for (auto& node : nodes_) {
+            node.pos = Vec3(0, 0, 0);
+            node.vel = Vec3(0, 0, 0);
         }
     }
 
@@ -1689,7 +1708,10 @@ private:
         }
         ImGui::SameLine();
         if (ImGui::Button("Reset View")) {
-            if (mode_2d_) {
+            if (mode_dag_) {
+                dag_pan_ = ImVec2(0, 0);
+                dag_zoom_ = 1.0f;
+            } else if (mode_2d_) {
                 camera_.pan_2d = Vec3(0, 0, 0);
                 camera_.zoom_2d = 50.0f;
             } else {
@@ -1889,10 +1911,11 @@ private:
 
         ImDrawList* draw_list = ImGui::GetWindowDrawList();
 
-        // Background
+        // Background - use SVG color #1e1f22 for DAG mode
+        ImU32 bg_color = mode_dag_ ? IM_COL32(30, 31, 34, 255) : IM_COL32(15, 15, 20, 255);
         draw_list->AddRectFilled(canvas_pos,
                                  ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
-                                 IM_COL32(15, 15, 20, 255));
+                                 bg_color);
 
         if (nodes_.empty()) {
             draw_list->AddText(
@@ -1900,6 +1923,17 @@ private:
                        canvas_pos.y + canvas_size.y * 0.5f),
                 IM_COL32(128, 128, 128, 255),
                 "No data");
+            return;
+        }
+
+        // DAG mode uses separate rendering
+        if (mode_dag_) {
+            // Draw edges first (behind nodes)
+            if (show_edges_) {
+                draw_dag_edges(draw_list, canvas_pos, canvas_size);
+            }
+            // Draw nodes on top
+            draw_dag_nodes(draw_list, canvas_pos, canvas_size);
             return;
         }
 
@@ -1968,8 +2002,36 @@ private:
                 move_speed_ *= (1.0f + io.MouseWheel * 0.1f);
                 move_speed_ = std::clamp(move_speed_, 0.05f, 5.0f);
             }
-        } else if (mode_2d_ || mode_dag_) {
-            // 2D/DAG camera controls: pan and zoom
+        } else if (mode_dag_) {
+            // DAG mode: pan and zoom in pixel space
+            if (is_active && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                // Pan with left mouse drag (in pixel coordinates)
+                dag_pan_.x += io.MouseDelta.x / dag_zoom_;
+                dag_pan_.y += io.MouseDelta.y / dag_zoom_;
+            }
+
+            // Zoom with scroll wheel
+            if (is_hovered && std::abs(io.MouseWheel) > 0.01f) {
+                // Zoom towards mouse position
+                ImVec2 mouse_pos = io.MousePos;
+                float cx = canvas_size.x * 0.5f - dag_canvas_width_ * 0.5f * dag_zoom_;
+                float cy = canvas_size.y * 0.5f - dag_canvas_height_ * 0.5f * dag_zoom_;
+                
+                // Convert mouse to DAG coordinates (before zoom change)
+                float dag_x = (mouse_pos.x - canvas_pos.x - cx) / dag_zoom_ - dag_pan_.x;
+                float dag_y = (mouse_pos.y - canvas_pos.y - cy) / dag_zoom_ - dag_pan_.y;
+
+                dag_zoom_ *= (1.0f + io.MouseWheel * 0.1f);
+                dag_zoom_ = std::clamp(dag_zoom_, 0.1f, 10.0f);
+
+                // Adjust pan to keep point under mouse stationary
+                float new_cx = canvas_size.x * 0.5f - dag_canvas_width_ * 0.5f * dag_zoom_;
+                float new_cy = canvas_size.y * 0.5f - dag_canvas_height_ * 0.5f * dag_zoom_;
+                dag_pan_.x = (mouse_pos.x - canvas_pos.x - new_cx) / dag_zoom_ - dag_x;
+                dag_pan_.y = (mouse_pos.y - canvas_pos.y - new_cy) / dag_zoom_ - dag_y;
+            }
+        } else if (mode_2d_) {
+            // 2D mode: pan and zoom
             if (is_active && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                 // Pan with left mouse drag
                 float pan_speed = 1.0f / camera_.zoom_2d;
@@ -2015,30 +2077,54 @@ private:
             }
         }
 
-        // Hover detection
+        // Hover detection - different for DAG mode
         hovered_node_idx_ = -1;
+        dag_hovered_node_idx_ = -1;
+
         if (is_hovered) {
             ImVec2 mouse_pos = io.MousePos;
-            float best_dist_sq = 20.0f * 20.0f;
 
-            for (std::size_t i = 0; i < nodes_.size(); ++i) {
-                const auto& node = nodes_[i];
+            if (mode_dag_) {
+                // DAG mode: check if mouse is inside any node rectangle
+                for (std::size_t i = 0; i < dag_node_rects_.size(); ++i) {
+                    const auto& rect = dag_node_rects_[i];
+                    ImVec2 top_left = dag_to_screen(rect.x, rect.y, canvas_pos, canvas_size);
+                    ImVec2 bottom_right = dag_to_screen(rect.x + rect.width, rect.y + rect.height, canvas_pos, canvas_size);
 
-                // Skip very faded nodes
-                if (node.opacity < 0.1f) continue;
+                    if (mouse_pos.x >= top_left.x && mouse_pos.x <= bottom_right.x &&
+                        mouse_pos.y >= top_left.y && mouse_pos.y <= bottom_right.y) {
+                        dag_hovered_node_idx_ = static_cast<int>(i);
+                        // Also set hovered_node_idx_ for click handling compatibility
+                        auto it = addr_to_idx_.find(rect.address);
+                        if (it != addr_to_idx_.end()) {
+                            hovered_node_idx_ = static_cast<int>(it->second);
+                        }
+                        break;
+                    }
+                }
+            } else {
+                // Standard mode: distance-based hover
+                float best_dist_sq = 20.0f * 20.0f;
 
-                ImVec2 screen_pos = (mode_2d_ || mode_dag_) ? camera_.project_2d(node.pos, canvas_size)
-                                                          : camera_.project(node.pos, canvas_size);
-                screen_pos.x += canvas_pos.x;
-                screen_pos.y += canvas_pos.y;
+                for (std::size_t i = 0; i < nodes_.size(); ++i) {
+                    const auto& node = nodes_[i];
 
-                float dx = mouse_pos.x - screen_pos.x;
-                float dy = mouse_pos.y - screen_pos.y;
-                float dist_sq = dx * dx + dy * dy;
+                    // Skip very faded nodes
+                    if (node.opacity < 0.1f) continue;
 
-                if (dist_sq < best_dist_sq) {
-                    best_dist_sq = dist_sq;
-                    hovered_node_idx_ = static_cast<int>(i);
+                    ImVec2 screen_pos = mode_2d_ ? camera_.project_2d(node.pos, canvas_size)
+                                                 : camera_.project(node.pos, canvas_size);
+                    screen_pos.x += canvas_pos.x;
+                    screen_pos.y += canvas_pos.y;
+
+                    float dx = mouse_pos.x - screen_pos.x;
+                    float dy = mouse_pos.y - screen_pos.y;
+                    float dist_sq = dx * dx + dy * dy;
+
+                    if (dist_sq < best_dist_sq) {
+                        best_dist_sq = dist_sq;
+                        hovered_node_idx_ = static_cast<int>(i);
+                    }
                 }
             }
         }
@@ -2106,55 +2192,36 @@ private:
         }
     }
 
+    // Transform DAG pixel coordinates to screen coordinates
+    ImVec2 dag_to_screen(float x, float y, const ImVec2& canvas_pos, const ImVec2& canvas_size) const {
+        // Center the DAG canvas in the view, then apply pan and zoom
+        float cx = canvas_size.x * 0.5f - dag_canvas_width_ * 0.5f * dag_zoom_;
+        float cy = canvas_size.y * 0.5f - dag_canvas_height_ * 0.5f * dag_zoom_;
+        return ImVec2(
+            canvas_pos.x + cx + (x + dag_pan_.x) * dag_zoom_,
+            canvas_pos.y + cy + (y + dag_pan_.y) * dag_zoom_
+        );
+    }
+
     void draw_dag_edges(ImDrawList* draw_list, const ImVec2& canvas_pos, const ImVec2& canvas_size) {
+        // SVG colors: edge stroke #bae67e (green/lime)
+        const ImU32 edge_color = IM_COL32(186, 230, 126, 255);  // #bae67e
+
         for (const auto& poly : dag_edge_polylines_) {
             if (poly.points.size() < 2) continue;
 
-            // Get opacity from endpoint nodes
-            float edge_opacity = 1.0f;
-            auto it_from = addr_to_idx_.find(poly.from_addr);
-            auto it_to = addr_to_idx_.find(poly.to_addr);
-            if (it_from != addr_to_idx_.end() && it_to != addr_to_idx_.end()) {
-                edge_opacity = std::min(nodes_[it_from->second].opacity, 
-                                        nodes_[it_to->second].opacity);
-            }
-            if (edge_opacity < 0.05f) continue;
-
-            // Color based on importance
-            ImU32 edge_color;
-            if (selected_node_idx_ >= 0 && it_from != addr_to_idx_.end() && it_to != addr_to_idx_.end()) {
-                const auto& from_node = nodes_[it_from->second];
-                const auto& to_node = nodes_[it_to->second];
-                int alpha = static_cast<int>(edge_opacity * 150);
-                if (from_node.importance > 0.5f || to_node.importance > 0.5f) {
-                    edge_color = IM_COL32(100, 150, 255, alpha);
-                } else {
-                    edge_color = IM_COL32(80, 80, 120, alpha);
-                }
-            } else {
-                edge_color = IM_COL32(80, 100, 140, static_cast<int>(edge_opacity * 120));
-            }
-
             // Draw polyline segments
             for (std::size_t i = 0; i < poly.points.size() - 1; ++i) {
-                ImVec2 p1 = camera_.project_2d(poly.points[i], canvas_size);
-                ImVec2 p2 = camera_.project_2d(poly.points[i + 1], canvas_size);
-                p1.x += canvas_pos.x;
-                p1.y += canvas_pos.y;
-                p2.x += canvas_pos.x;
-                p2.y += canvas_pos.y;
-                draw_list->AddLine(p1, p2, edge_color, 1.5f);
+                ImVec2 p1 = dag_to_screen(poly.points[i].x, poly.points[i].y, canvas_pos, canvas_size);
+                ImVec2 p2 = dag_to_screen(poly.points[i + 1].x, poly.points[i + 1].y, canvas_pos, canvas_size);
+                draw_list->AddLine(p1, p2, edge_color, 1.0f);
             }
 
             // Draw arrowhead at the end
             if (poly.points.size() >= 2) {
                 std::size_t last = poly.points.size() - 1;
-                ImVec2 end_pt = camera_.project_2d(poly.points[last], canvas_size);
-                ImVec2 prev_pt = camera_.project_2d(poly.points[last - 1], canvas_size);
-                end_pt.x += canvas_pos.x;
-                end_pt.y += canvas_pos.y;
-                prev_pt.x += canvas_pos.x;
-                prev_pt.y += canvas_pos.y;
+                ImVec2 end_pt = dag_to_screen(poly.points[last].x, poly.points[last].y, canvas_pos, canvas_size);
+                ImVec2 prev_pt = dag_to_screen(poly.points[last - 1].x, poly.points[last - 1].y, canvas_pos, canvas_size);
 
                 // Compute arrow direction
                 float dx = end_pt.x - prev_pt.x;
@@ -2164,15 +2231,15 @@ private:
                     dx /= len;
                     dy /= len;
 
-                    // Arrow size
-                    float arrow_size = 6.0f;
-                    float arrow_width = 3.0f;
+                    // Arrow size (small triangle like SVG)
+                    float arrow_size = 5.0f * dag_zoom_;
+                    float arrow_width = 2.5f * dag_zoom_;
 
                     // Perpendicular vector
                     float px = -dy;
                     float py = dx;
 
-                    // Arrow points
+                    // Arrow points (triangle)
                     ImVec2 arrow_tip = end_pt;
                     ImVec2 arrow_left = ImVec2(
                         end_pt.x - dx * arrow_size + px * arrow_width,
@@ -2186,6 +2253,64 @@ private:
                     draw_list->AddTriangleFilled(arrow_tip, arrow_left, arrow_right, edge_color);
                 }
             }
+        }
+    }
+
+    void draw_dag_nodes(ImDrawList* draw_list, const ImVec2& canvas_pos, const ImVec2& canvas_size) {
+        // SVG colors:
+        // Background: #1e1f22 (already set as canvas background)
+        // Node fill: #1c1f24 (slightly darker)
+        // Node stroke: #646464 (medium gray)
+        // Text: #ed9366 (orange/peach)
+        const ImU32 node_fill = IM_COL32(28, 31, 36, 255);      // #1c1f24
+        const ImU32 node_stroke = IM_COL32(100, 100, 100, 255); // #646464
+        const ImU32 text_color = IM_COL32(237, 147, 102, 255);  // #ed9366
+        const ImU32 selected_stroke = IM_COL32(186, 230, 126, 255);  // #bae67e (green for selected)
+
+        for (std::size_t i = 0; i < dag_node_rects_.size(); ++i) {
+            const auto& rect = dag_node_rects_[i];
+
+            ImVec2 top_left = dag_to_screen(rect.x, rect.y, canvas_pos, canvas_size);
+            ImVec2 bottom_right = dag_to_screen(rect.x + rect.width, rect.y + rect.height, canvas_pos, canvas_size);
+
+            // Culling - skip if outside canvas
+            if (bottom_right.x < canvas_pos.x || top_left.x > canvas_pos.x + canvas_size.x ||
+                bottom_right.y < canvas_pos.y || top_left.y > canvas_pos.y + canvas_size.y) {
+                continue;
+            }
+
+            // Check if this node is selected or hovered
+            bool is_selected = (selected_addr_ == rect.address);
+            bool is_hovered = (dag_hovered_node_idx_ == static_cast<int>(i));
+
+            // Draw filled rectangle
+            draw_list->AddRectFilled(top_left, bottom_right, node_fill);
+
+            // Draw border (highlight if selected/hovered)
+            ImU32 stroke = is_selected ? selected_stroke : (is_hovered ? IM_COL32(150, 150, 150, 255) : node_stroke);
+            float stroke_width = (is_selected || is_hovered) ? 2.0f : 1.0f;
+            draw_list->AddRect(top_left, bottom_right, stroke, 0.0f, 0, stroke_width);
+
+            // Draw text centered in rectangle
+            float rect_width = bottom_right.x - top_left.x;
+            float rect_height = bottom_right.y - top_left.y;
+            
+            // Truncate name if too long
+            std::string display_name = rect.name;
+            float char_width = 7.0f * dag_zoom_;  // Approximate
+            int max_chars = static_cast<int>(rect_width / char_width);
+            if (max_chars > 2 && static_cast<int>(display_name.length()) > max_chars) {
+                display_name = display_name.substr(0, max_chars - 2) + "..";
+            }
+
+            // Calculate text position (centered)
+            ImVec2 text_size = ImGui::CalcTextSize(display_name.c_str());
+            ImVec2 text_pos = ImVec2(
+                top_left.x + (rect_width - text_size.x) * 0.5f,
+                top_left.y + (rect_height - text_size.y) * 0.5f
+            );
+
+            draw_list->AddText(text_pos, text_color, display_name.c_str());
         }
     }
 
@@ -2374,8 +2499,15 @@ private:
     bool mode_2d_ = false;        // 2D force layout mode
     bool mode_dag_ = false;       // DAG flowchart layout mode
 
-    // DAG layout edge polylines (for orthogonal routing)
+    // DAG layout data (pixel coordinates from GraphGridLayout)
+    std::vector<DAGNodeRect> dag_node_rects_;
     std::vector<DAGEdgePolyline> dag_edge_polylines_;
+    std::unordered_map<ea_t, std::size_t> dag_addr_to_rect_idx_;
+    float dag_canvas_width_ = 0;
+    float dag_canvas_height_ = 0;
+    float dag_zoom_ = 1.0f;
+    ImVec2 dag_pan_{0, 0};
+    int dag_hovered_node_idx_ = -1;
 
     // EA tracking
     bool track_ea_ = false;
