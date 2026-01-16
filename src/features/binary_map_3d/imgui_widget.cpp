@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <random>
 #include <algorithm>
+#include <queue>
 
 namespace synopsia {
 namespace features {
@@ -66,6 +67,10 @@ struct Camera {
     // Free flight mode
     bool free_flight = false;
     Vec3 position{0, 0, 8};  // Used in free flight mode
+
+    // 2D mode settings
+    float zoom_2d = 50.0f;   // Pixels per unit in 2D mode
+    Vec3 pan_2d{0, 0, 0};    // Pan offset in 2D mode (only x, y used)
 
     Vec3 get_position() const {
         if (free_flight) {
@@ -142,6 +147,19 @@ struct Camera {
         float py = (-y * scale / z + 1.0f) * 0.5f * screen_size.y;
 
         return {px, py};
+    }
+
+    // 2D orthographic projection (top-down view, x-y plane)
+    ImVec2 project_2d(const Vec3& point, const ImVec2& screen_size) const {
+        // Center of screen + (point position - pan offset) * zoom
+        float px = screen_size.x * 0.5f + (point.x - pan_2d.x) * zoom_2d;
+        float py = screen_size.y * 0.5f - (point.y - pan_2d.y) * zoom_2d;  // Flip Y for screen coords
+        return {px, py};
+    }
+
+    // For 2D mode, depth is just used for ordering - use Y coordinate
+    float get_depth_2d(const Vec3& point) const {
+        return -point.y;  // Lower Y = further back
     }
 
     float get_depth(const Vec3& point) const {
@@ -902,7 +920,13 @@ private:
     }
 
     void init_positions() {
-        // Initialize with random positions on a sphere
+        if (mode_2d_) {
+            // 2D mode: use KK + modified FR layout (Gabriel et al.)
+            compute_2d_force_layout();
+            return;
+        }
+
+        // 3D mode: initialize with random positions on a sphere
         std::mt19937 rng(42);
         std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
@@ -910,18 +934,272 @@ private:
         if (radius < 1.0f) radius = 1.0f;
 
         for (auto& node : nodes_) {
-            // Random point in sphere
             Vec3 p;
             do {
                 p = Vec3(dist(rng), dist(rng), dist(rng));
             } while (p.length_sq() > 1.0f);
-
             node.pos = p * radius;
             node.vel = Vec3(0, 0, 0);
         }
     }
 
+    /// 2D Force-directed layout using Kamada-Kawai + Modified Fruchterman-Reingold
+    /// Based on "Summarization meets Visualization on Online Social Networks" (Gabriel et al.)
+    /// KK provides initial layout, then modified FR refines with similarity-based forces
+    void compute_2d_force_layout() {
+        if (nodes_.empty()) return;
+        
+        const std::size_t n = nodes_.size();
+        if (n == 1) {
+            nodes_[0].pos = Vec3(0, 0, 0);
+            return;
+        }
+
+        // Build adjacency set for fast lookup
+        std::vector<std::unordered_set<std::size_t>> adj(n);
+        for (const auto& edge : edges_) {
+            auto it_from = addr_to_idx_.find(edge.from);
+            auto it_to = addr_to_idx_.find(edge.to);
+            if (it_from != addr_to_idx_.end() && it_to != addr_to_idx_.end()) {
+                adj[it_from->second].insert(it_to->second);
+                adj[it_to->second].insert(it_from->second);  // Undirected for layout
+            }
+        }
+
+        // =====================================================================
+        // Step 1: Compute shortest path distances using BFS (for KK ideal lengths)
+        // =====================================================================
+        std::vector<std::vector<int>> dist(n, std::vector<int>(n, static_cast<int>(n + 1)));
+        
+        for (std::size_t src = 0; src < n; ++src) {
+            dist[src][src] = 0;
+            std::queue<std::size_t> bfs;
+            bfs.push(src);
+            while (!bfs.empty()) {
+                std::size_t u = bfs.front();
+                bfs.pop();
+                for (std::size_t v : adj[u]) {
+                    if (dist[src][v] > dist[src][u] + 1) {
+                        dist[src][v] = dist[src][u] + 1;
+                        bfs.push(v);
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // Step 2: Compute Jaccard similarity between nodes (shared neighbors)
+        // =====================================================================
+        std::vector<std::vector<float>> similarity(n, std::vector<float>(n, 0.0f));
+        
+        for (std::size_t i = 0; i < n; ++i) {
+            similarity[i][i] = 1.0f;
+            for (std::size_t j = i + 1; j < n; ++j) {
+                // Jaccard: |intersection| / |union|
+                std::size_t intersect = 0;
+                for (std::size_t nb : adj[i]) {
+                    if (adj[j].count(nb)) intersect++;
+                }
+                // Also count direct edge as similarity
+                if (adj[i].count(j)) intersect++;
+                
+                std::size_t union_size = adj[i].size() + adj[j].size() - intersect;
+                if (union_size > 0) {
+                    similarity[i][j] = static_cast<float>(intersect) / static_cast<float>(union_size);
+                }
+                similarity[j][i] = similarity[i][j];
+                
+                // Ensure minimum similarity to avoid division issues
+                if (similarity[i][j] < 0.01f) similarity[i][j] = 0.01f;
+                if (similarity[j][i] < 0.01f) similarity[j][i] = 0.01f;
+            }
+        }
+
+        // =====================================================================
+        // Step 3: Kamada-Kawai for initial layout
+        // Energy-based spring system with ideal lengths = graph distances
+        // =====================================================================
+        const float L = 1.5f;  // Ideal edge length
+        const float K = 1.0f;  // Spring constant
+        const int kk_iterations = std::min(300, static_cast<int>(n * 10));
+        
+        // Initialize positions in a circle
+        for (std::size_t i = 0; i < n; ++i) {
+            float angle = 2.0f * 3.14159f * static_cast<float>(i) / static_cast<float>(n);
+            float radius = std::sqrt(static_cast<float>(n)) * 0.8f;
+            nodes_[i].pos = Vec3(radius * std::cos(angle), radius * std::sin(angle), 0.0f);
+        }
+
+        // KK main loop - move node with highest energy
+        for (int iter = 0; iter < kk_iterations; ++iter) {
+            // Find node with maximum delta (energy gradient)
+            std::size_t max_node = 0;
+            float max_delta = 0.0f;
+            
+            for (std::size_t m = 0; m < n; ++m) {
+                float dx = 0.0f, dy = 0.0f;
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (i == m) continue;
+                    
+                    float d_mi = dist[m][i];
+                    if (d_mi > static_cast<int>(n)) d_mi = static_cast<float>(n);  // Disconnected
+                    float l_mi = L * d_mi;  // Ideal distance
+                    float k_mi = K / (d_mi * d_mi + 0.1f);  // Spring strength
+                    
+                    float diff_x = nodes_[m].pos.x - nodes_[i].pos.x;
+                    float diff_y = nodes_[m].pos.y - nodes_[i].pos.y;
+                    float actual_dist = std::sqrt(diff_x * diff_x + diff_y * diff_y);
+                    if (actual_dist < 0.01f) actual_dist = 0.01f;
+                    
+                    float factor = k_mi * (actual_dist - l_mi) / actual_dist;
+                    dx += factor * diff_x;
+                    dy += factor * diff_y;
+                }
+                
+                float delta = std::sqrt(dx * dx + dy * dy);
+                if (delta > max_delta) {
+                    max_delta = delta;
+                    max_node = m;
+                }
+            }
+            
+            if (max_delta < 0.01f) break;  // Converged
+            
+            // Move the node with highest energy
+            float dx = 0.0f, dy = 0.0f;
+            float dxx = 0.0f, dxy = 0.0f, dyy = 0.0f;
+            
+            for (std::size_t i = 0; i < n; ++i) {
+                if (i == max_node) continue;
+                
+                float d_mi = static_cast<float>(dist[max_node][i]);
+                if (d_mi > static_cast<float>(n)) d_mi = static_cast<float>(n);
+                float l_mi = L * d_mi;
+                float k_mi = K / (d_mi * d_mi + 0.1f);
+                
+                float diff_x = nodes_[max_node].pos.x - nodes_[i].pos.x;
+                float diff_y = nodes_[max_node].pos.y - nodes_[i].pos.y;
+                float dist_sq = diff_x * diff_x + diff_y * diff_y;
+                float actual_dist = std::sqrt(dist_sq);
+                if (actual_dist < 0.01f) actual_dist = 0.01f;
+                
+                dx += k_mi * (1.0f - l_mi / actual_dist) * diff_x;
+                dy += k_mi * (1.0f - l_mi / actual_dist) * diff_y;
+                
+                dxx += k_mi * (1.0f - l_mi * diff_y * diff_y / (dist_sq * actual_dist));
+                dxy += k_mi * l_mi * diff_x * diff_y / (dist_sq * actual_dist);
+                dyy += k_mi * (1.0f - l_mi * diff_x * diff_x / (dist_sq * actual_dist));
+            }
+            
+            // Solve 2x2 system to find displacement
+            float det = dxx * dyy - dxy * dxy;
+            if (std::abs(det) > 0.0001f) {
+                float move_x = (dyy * dx - dxy * dy) / det;
+                float move_y = (dxx * dy - dxy * dx) / det;
+                nodes_[max_node].pos.x -= move_x;
+                nodes_[max_node].pos.y -= move_y;
+            }
+        }
+
+        // =====================================================================
+        // Step 4: Modified Fruchterman-Reingold with similarity-based forces
+        // Repulsion: F_r = f² * distance / similarity
+        // Attraction: F_a = distance * similarity / f²
+        // =====================================================================
+        const float area = static_cast<float>(n) * 4.0f;
+        const float f = std::sqrt(area / static_cast<float>(n));  // Optimal distance
+        float temperature = std::sqrt(area) * 0.5f;
+        const float cooling = 0.95f;
+        const int fr_iterations = std::min(200, static_cast<int>(n * 5));
+        
+        std::vector<Vec3> displacement(n);
+        
+        for (int iter = 0; iter < fr_iterations; ++iter) {
+            // Reset displacements
+            for (std::size_t i = 0; i < n; ++i) {
+                displacement[i] = Vec3(0, 0, 0);
+            }
+            
+            // Repulsive forces between all pairs (modified by similarity)
+            for (std::size_t i = 0; i < n; ++i) {
+                for (std::size_t j = i + 1; j < n; ++j) {
+                    Vec3 delta = nodes_[i].pos - nodes_[j].pos;
+                    float d = std::sqrt(delta.x * delta.x + delta.y * delta.y);
+                    if (d < 0.01f) d = 0.01f;
+                    
+                    // Modified repulsion: inversely proportional to similarity
+                    // Higher similarity = less repulsion (they should be closer)
+                    float sim = similarity[i][j];
+                    float repulsion = (f * f) / (d * sim);  // Paper formula
+                    
+                    Vec3 dir = Vec3(delta.x / d, delta.y / d, 0);
+                    displacement[i] = displacement[i] + dir * repulsion;
+                    displacement[j] = displacement[j] - dir * repulsion;
+                }
+            }
+            
+            // Attractive forces along edges (modified by similarity)
+            for (const auto& edge : edges_) {
+                auto it_from = addr_to_idx_.find(edge.from);
+                auto it_to = addr_to_idx_.find(edge.to);
+                if (it_from == addr_to_idx_.end() || it_to == addr_to_idx_.end()) continue;
+                
+                std::size_t i = it_from->second;
+                std::size_t j = it_to->second;
+                
+                Vec3 delta = nodes_[i].pos - nodes_[j].pos;
+                float d = std::sqrt(delta.x * delta.x + delta.y * delta.y);
+                if (d < 0.01f) continue;
+                
+                // Modified attraction: proportional to similarity
+                // Higher similarity = more attraction
+                float sim = similarity[i][j];
+                float attraction = (d * sim) / (f * f);  // Paper formula
+                
+                Vec3 dir = Vec3(delta.x / d, delta.y / d, 0);
+                displacement[i] = displacement[i] - dir * attraction;
+                displacement[j] = displacement[j] + dir * attraction;
+            }
+            
+            // Apply displacements with temperature limiting
+            float max_disp = 0.0f;
+            for (std::size_t i = 0; i < n; ++i) {
+                float d = std::sqrt(displacement[i].x * displacement[i].x + 
+                                    displacement[i].y * displacement[i].y);
+                if (d > 0.001f) {
+                    float capped = std::min(d, temperature);
+                    nodes_[i].pos.x += (displacement[i].x / d) * capped;
+                    nodes_[i].pos.y += (displacement[i].y / d) * capped;
+                    max_disp = std::max(max_disp, capped);
+                }
+                nodes_[i].pos.z = 0.0f;  // Keep in 2D plane
+            }
+            
+            // Cool down
+            temperature *= cooling;
+            
+            // Early termination if converged
+            if (max_disp < 0.01f) break;
+        }
+
+        // Center the layout
+        Vec3 center(0, 0, 0);
+        for (const auto& node : nodes_) {
+            center += node.pos;
+        }
+        center = center * (1.0f / static_cast<float>(n));
+        for (auto& node : nodes_) {
+            node.pos = node.pos - center;
+            node.vel = Vec3(0, 0, 0);
+        }
+    }
+
     void step_simulation() {
+        // 2D mode uses static hierarchical layout, no force simulation needed
+        if (mode_2d_) {
+            simulation_running_ = false;
+            return;
+        }
         if (!simulation_running_ || nodes_.empty()) return;
 
         const float repulsion = 50.0f;
@@ -1212,12 +1490,32 @@ private:
         }
 
         ImGui::Separator();
+        ImGui::Text("View Mode:");
 
-        if (ImGui::Checkbox("Free Flight", &camera_.free_flight)) {
-            if (camera_.free_flight) {
-                camera_.enter_free_flight();
-            } else {
-                camera_.exit_free_flight();
+        bool prev_2d = mode_2d_;
+        if (ImGui::Checkbox("2D Flowgraph", &mode_2d_)) {
+            if (mode_2d_ != prev_2d) {
+                // Exit free flight when switching to 2D
+                if (mode_2d_ && camera_.free_flight) {
+                    camera_.exit_free_flight();
+                }
+                // Restart simulation to re-layout in 2D/3D
+                restart_simulation();
+            }
+        }
+        if (mode_2d_) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(hierarchical)");
+        }
+
+        // Free Flight only available in 3D mode
+        if (!mode_2d_) {
+            if (ImGui::Checkbox("Free Flight", &camera_.free_flight)) {
+                if (camera_.free_flight) {
+                    camera_.enter_free_flight();
+                } else {
+                    camera_.exit_free_flight();
+                }
             }
         }
 
@@ -1226,10 +1524,28 @@ private:
             simulation_running_ = true;
             simulation_iterations_ = 0;
         }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset View")) {
+            if (mode_2d_) {
+                camera_.pan_2d = Vec3(0, 0, 0);
+                camera_.zoom_2d = 50.0f;
+            } else {
+                camera_.target = Vec3(0, 0, 0);
+                camera_.distance = 8.0f;
+                camera_.yaw = 0.4f;
+                camera_.pitch = 0.3f;
+                if (camera_.free_flight) {
+                    camera_.exit_free_flight();
+                }
+            }
+        }
 
         ImGui::Separator();
         ImGui::Text("Controls:");
-        if (camera_.free_flight) {
+        if (mode_2d_) {
+            ImGui::BulletText("Drag: Pan");
+            ImGui::BulletText("Scroll: Zoom");
+        } else if (camera_.free_flight) {
             ImGui::BulletText("WASD/Arrows: Move");
             ImGui::BulletText("Q/E: Up/Down");
             ImGui::BulletText("Mouse: Look");
@@ -1487,8 +1803,33 @@ private:
                 move_speed_ *= (1.0f + io.MouseWheel * 0.1f);
                 move_speed_ = std::clamp(move_speed_, 0.05f, 5.0f);
             }
+        } else if (mode_2d_) {
+            // 2D camera controls: pan and zoom
+            if (is_active && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                // Pan with left mouse drag
+                float pan_speed = 1.0f / camera_.zoom_2d;
+                camera_.pan_2d.x -= io.MouseDelta.x * pan_speed;
+                camera_.pan_2d.y += io.MouseDelta.y * pan_speed;  // Flip Y
+            }
+
+            // Zoom with scroll wheel
+            if (is_hovered && std::abs(io.MouseWheel) > 0.01f) {
+                // Zoom towards mouse position
+                ImVec2 mouse_pos = io.MousePos;
+                float rel_x = (mouse_pos.x - canvas_pos.x - canvas_size.x * 0.5f) / camera_.zoom_2d;
+                float rel_y = -(mouse_pos.y - canvas_pos.y - canvas_size.y * 0.5f) / camera_.zoom_2d;
+
+                float old_zoom = camera_.zoom_2d;
+                camera_.zoom_2d *= (1.0f + io.MouseWheel * 0.1f);
+                camera_.zoom_2d = std::clamp(camera_.zoom_2d, 5.0f, 500.0f);
+
+                // Adjust pan to keep point under mouse stationary
+                float zoom_ratio = camera_.zoom_2d / old_zoom;
+                camera_.pan_2d.x += rel_x * (1.0f - 1.0f / zoom_ratio);
+                camera_.pan_2d.y += rel_y * (1.0f - 1.0f / zoom_ratio);
+            }
         } else {
-            // Orbit camera controls
+            // 3D orbit camera controls
             if (is_active && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                 if (io.KeyShift) {
                     float pan_speed = 0.01f * camera_.distance;
@@ -1521,7 +1862,8 @@ private:
                 // Skip very faded nodes
                 if (node.opacity < 0.1f) continue;
 
-                ImVec2 screen_pos = camera_.project(node.pos, canvas_size);
+                ImVec2 screen_pos = mode_2d_ ? camera_.project_2d(node.pos, canvas_size)
+                                             : camera_.project(node.pos, canvas_size);
                 screen_pos.x += canvas_pos.x;
                 screen_pos.y += canvas_pos.y;
 
@@ -1564,15 +1906,17 @@ private:
             // Note: In "only neighbors" mode, edges_ is already filtered to only contain
             // edges between filtered nodes, so no additional visibility check needed
 
-            ImVec2 from_screen = camera_.project(from_node.pos, canvas_size);
-            ImVec2 to_screen = camera_.project(to_node.pos, canvas_size);
+            ImVec2 from_screen = mode_2d_ ? camera_.project_2d(from_node.pos, canvas_size)
+                                          : camera_.project(from_node.pos, canvas_size);
+            ImVec2 to_screen = mode_2d_ ? camera_.project_2d(to_node.pos, canvas_size)
+                                        : camera_.project(to_node.pos, canvas_size);
 
             from_screen.x += canvas_pos.x;
             from_screen.y += canvas_pos.y;
             to_screen.x += canvas_pos.x;
             to_screen.y += canvas_pos.y;
 
-            if (from_screen.x < -5000 || to_screen.x < -5000) continue;
+            if (!mode_2d_ && (from_screen.x < -5000 || to_screen.x < -5000)) continue;
 
             // Color based on importance
             ImU32 edge_color;
@@ -1592,7 +1936,7 @@ private:
     }
 
     void draw_nodes(ImDrawList* draw_list, const ImVec2& canvas_pos, const ImVec2& canvas_size) {
-        // Sort by depth for proper rendering order
+        // Sort by depth for proper rendering order (in 3D) or just render in order (in 2D)
         struct NodeRender {
             int idx;
             float depth;
@@ -1601,7 +1945,9 @@ private:
         sorted.reserve(nodes_.size());
 
         for (std::size_t i = 0; i < nodes_.size(); ++i) {
-            sorted.push_back({static_cast<int>(i), camera_.get_depth(nodes_[i].pos)});
+            float depth = mode_2d_ ? camera_.get_depth_2d(nodes_[i].pos)
+                                   : camera_.get_depth(nodes_[i].pos);
+            sorted.push_back({static_cast<int>(i), depth});
         }
 
         std::sort(sorted.begin(), sorted.end(),
@@ -1616,7 +1962,8 @@ private:
             // Note: In "only neighbors" mode, nodes_ is already filtered to only contain
             // nodes within max_depth of selection, so no additional visibility check needed
 
-            ImVec2 screen_pos = camera_.project(node.pos, canvas_size);
+            ImVec2 screen_pos = mode_2d_ ? camera_.project_2d(node.pos, canvas_size)
+                                         : camera_.project(node.pos, canvas_size);
             screen_pos.x += canvas_pos.x;
             screen_pos.y += canvas_pos.y;
 
@@ -1628,8 +1975,8 @@ private:
                 continue;
             }
 
-            // Size with depth perspective
-            float depth_scale = 1.0f / (1.0f + nr.depth * 0.05f);
+            // Size with depth perspective (no perspective in 2D mode)
+            float depth_scale = mode_2d_ ? 1.0f : (1.0f / (1.0f + nr.depth * 0.05f));
             float size = base_node_size_ * node.scale * depth_scale;
             size = std::clamp(size, 2.0f, 30.0f);
 
@@ -1770,6 +2117,7 @@ private:
     bool show_edges_ = true;
     bool show_labels_ = false;
     bool skip_hub_nodes_ = true;  // Don't traverse nodes with 20+ connections
+    bool mode_2d_ = false;        // 2D mode (default is 3D)
 
     // EA tracking
     bool track_ea_ = false;
