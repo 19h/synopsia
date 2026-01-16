@@ -169,6 +169,9 @@ struct GraphNode {
     std::uint32_t caller_count = 0;
     std::uint32_t callee_count = 0;
     int graph_distance = -1;  // Distance from selected node (-1 = not computed)
+    int follow_distance = -1; // Distance from nearest followed node (-1 = not computed)
+    bool is_hub = false;      // True if node has too many connections (not traversed)
+    bool is_followed = false; // True if this node is being followed
 
     // Visual properties
     float importance = 0.0f;  // 0-1, relative to selected node
@@ -187,6 +190,11 @@ public:
     void refresh_data() {
         data_.refresh();
 
+        // Get current EA from IDA if not established
+        if (current_ea_ == BADADDR) {
+            current_ea_ = get_screen_ea();
+        }
+
         // In focused mode with valid EA, do targeted load (much faster for large binaries)
         if (only_show_neighbors_ && current_ea_ != BADADDR) {
             func_t* func = get_func(current_ea_);
@@ -198,7 +206,7 @@ public:
             }
         }
 
-        // Normal mode: build full graph
+        // Normal mode: build full graph (with limit)
         build_full_graph();
         selected_addr_ = BADADDR;
         selected_node_idx_ = -1;
@@ -208,6 +216,8 @@ public:
 
     void on_ea_changed(ea_t ea) {
         current_ea_ = ea;
+        // In locked mode, don't update the graph
+        if (graph_locked_) return;
         if (track_ea_) {
             select_node_at_ea(ea);
         }
@@ -216,6 +226,12 @@ public:
     void set_focused_mode(bool enabled) {
         track_ea_ = enabled;
         only_show_neighbors_ = enabled;
+
+        // Get current EA from IDA if not established
+        if (current_ea_ == BADADDR) {
+            current_ea_ = get_screen_ea();
+        }
+
         if (enabled && current_ea_ != BADADDR) {
             // Focused mode: do targeted load
             func_t* func = get_func(current_ea_);
@@ -270,7 +286,8 @@ public:
     }
 
 private:
-    static constexpr std::size_t MAX_NODES = 10000;
+    static constexpr std::size_t MAX_NODES = 2000;
+    static constexpr int HUB_NODE_THRESHOLD = 20;  // Nodes with 20+ connections are "hubs"
 
     void build_full_graph() {
         all_nodes_.clear();
@@ -311,6 +328,23 @@ private:
         }
     }
 
+    /// Count xrefs for a function (callers + callees)
+    int count_function_xrefs(ea_t func_ea) {
+        int count = 0;
+        xrefblk_t xb;
+        // Count callers
+        for (bool ok = xb.first_to(func_ea, XREF_FAR); ok; ok = xb.next_to()) {
+            if (xb.type == fl_CF || xb.type == fl_CN || xb.type == fl_JF || xb.type == fl_JN)
+                count++;
+        }
+        // Count callees (approximate - just from function start)
+        for (bool ok = xb.first_from(func_ea, XREF_FAR); ok; ok = xb.next_from()) {
+            if (xb.type == fl_CF || xb.type == fl_CN || xb.type == fl_JF || xb.type == fl_JN)
+                count++;
+        }
+        return count;
+    }
+
     /// Load only neighbors within max_depth from a given EA (for focused mode)
     /// This is much faster than building full graph for large binaries
     void load_neighbors_from_ea(ea_t center_ea) {
@@ -323,6 +357,7 @@ private:
 
         // BFS to find all functions within max_depth
         std::unordered_set<ea_t> visited;
+        std::unordered_set<ea_t> hub_nodes;  // Nodes with too many connections
         std::vector<std::pair<ea_t, int>> queue;  // (address, distance)
         std::unordered_map<ea_t, int> distances;
 
@@ -335,6 +370,15 @@ private:
             auto [current_ea, current_dist] = queue[head++];
 
             if (current_dist >= max_depth_) continue;
+
+            // Check if this is a hub node (skip traversing but keep the node)
+            if (skip_hub_nodes_ && current_ea != center_ea) {
+                int xref_count = count_function_xrefs(current_ea);
+                if (xref_count >= HUB_NODE_THRESHOLD) {
+                    hub_nodes.insert(current_ea);
+                    continue;  // Don't traverse from hub nodes
+                }
+            }
 
             // Get function at this EA
             func_t* func = get_func(current_ea);
@@ -419,8 +463,16 @@ private:
             }
             node.opacity = 1.0f;
 
+            // Mark as hub if it has too many connections
+            node.is_hub = hub_nodes.find(func_ea) != hub_nodes.end();
+
             float connectivity = static_cast<float>(caller_count + callee_count);
-            node.scale = 0.8f + std::min(connectivity / 20.0f, 2.0f);
+            // Hub nodes get larger scale to indicate they're connection hubs
+            if (node.is_hub) {
+                node.scale = 2.0f;  // Fixed larger size for hubs
+            } else {
+                node.scale = 0.8f + std::min(connectivity / 20.0f, 2.0f);
+            }
 
             addr_to_idx_[func_ea] = nodes_.size();
             nodes_.push_back(node);
@@ -564,6 +616,282 @@ private:
         auto sel_it = new_addr_to_idx.find(selected_addr);
         if (sel_it != new_addr_to_idx.end()) {
             selected_node_idx_ = static_cast<int>(sel_it->second);
+        }
+    }
+
+    /// Toggle follow on a node (Alt+click in locked mode)
+    void toggle_follow_node(ea_t addr) {
+        if (addr == BADADDR) return;
+
+        // Check if node exists in our current graph (may be in base or expanded)
+        auto it = addr_to_idx_.find(addr);
+        if (it == addr_to_idx_.end()) {
+            // Node might not be in current graph but could be in base - check base
+            auto base_it = base_addr_to_idx_.find(addr);
+            if (base_it == base_addr_to_idx_.end()) return;
+        }
+
+        if (followed_nodes_.find(addr) != followed_nodes_.end()) {
+            // Unfollow: remove from set and rebuild graph from base + remaining follows
+            followed_nodes_.erase(addr);
+            rebuild_from_base_with_follows();
+        } else {
+            // Follow: add to set and expand graph with neighbors
+            followed_nodes_.insert(addr);
+            if (it != addr_to_idx_.end()) {
+                nodes_[it->second].is_followed = true;
+            }
+            add_neighbors_to_graph(addr);
+        }
+
+        // Recompute distances and opacity
+        compute_follow_distances();
+    }
+
+    /// Add immediate neighbors of a node to the current graph (for follow mode)
+    void add_neighbors_to_graph(ea_t center_ea) {
+        if (center_ea == BADADDR) return;
+
+        func_t* func = get_func(center_ea);
+        if (!func) return;
+
+        std::vector<ea_t> new_neighbors;
+
+        // Find callers (xrefs TO this function)
+        xrefblk_t xb;
+        for (bool ok = xb.first_to(func->start_ea, XREF_FAR); ok; ok = xb.next_to()) {
+            if (xb.type != fl_CF && xb.type != fl_CN && xb.type != fl_JF && xb.type != fl_JN)
+                continue;
+
+            func_t* caller_func = get_func(xb.from);
+            if (!caller_func) continue;
+
+            ea_t caller_ea = caller_func->start_ea;
+            if (addr_to_idx_.find(caller_ea) == addr_to_idx_.end()) {
+                new_neighbors.push_back(caller_ea);
+            }
+        }
+
+        // Find callees (xrefs FROM this function)
+        func_item_iterator_t fii;
+        for (bool ok = fii.set(func); ok; ok = fii.next_code()) {
+            ea_t item_ea = fii.current();
+            xrefblk_t xb2;
+            for (bool ok2 = xb2.first_from(item_ea, XREF_FAR); ok2; ok2 = xb2.next_from()) {
+                if (xb2.type != fl_CF && xb2.type != fl_CN && xb2.type != fl_JF && xb2.type != fl_JN)
+                    continue;
+
+                func_t* callee_func = get_func(xb2.to);
+                if (!callee_func) continue;
+
+                ea_t callee_ea = callee_func->start_ea;
+                if (addr_to_idx_.find(callee_ea) == addr_to_idx_.end()) {
+                    new_neighbors.push_back(callee_ea);
+                }
+            }
+        }
+
+        // Add new nodes to the graph
+        for (ea_t neighbor_ea : new_neighbors) {
+            func_t* nfunc = get_func(neighbor_ea);
+            if (!nfunc) continue;
+
+            // Check MAX_NODES limit
+            if (nodes_.size() >= MAX_NODES) break;
+
+            GraphNode node;
+            node.address = neighbor_ea;
+
+            // Get function name
+            qstring name;
+            if (get_func_name(&name, neighbor_ea) > 0) {
+                node.name = name.c_str();
+            } else {
+                char buf[32];
+                qsnprintf(buf, sizeof(buf), "sub_%llX", (unsigned long long)neighbor_ea);
+                node.name = buf;
+            }
+
+            node.size = static_cast<std::size_t>(nfunc->end_ea - nfunc->start_ea);
+
+            // Random position near the parent
+            auto center_it = addr_to_idx_.find(center_ea);
+            Vec3 parent_pos = (center_it != addr_to_idx_.end()) ? nodes_[center_it->second].pos : Vec3(0, 0, 0);
+            std::random_device rd;
+            std::mt19937 rng(rd());
+            std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+            node.pos = parent_pos + Vec3(dist(rng), dist(rng), dist(rng));
+            node.vel = Vec3(0, 0, 0);
+
+            // Count xrefs
+            int caller_count = 0, callee_count = 0;
+            xrefblk_t xb3;
+            for (bool ok = xb3.first_to(neighbor_ea, XREF_FAR); ok; ok = xb3.next_to()) {
+                if (xb3.type == fl_CF || xb3.type == fl_CN) caller_count++;
+            }
+            for (bool ok = xb3.first_from(neighbor_ea, XREF_FAR); ok; ok = xb3.next_from()) {
+                if (xb3.type == fl_CF || xb3.type == fl_CN) callee_count++;
+            }
+            node.caller_count = caller_count;
+            node.callee_count = callee_count;
+
+            float connectivity = static_cast<float>(caller_count + callee_count);
+            node.scale = 0.8f + std::min(connectivity / 20.0f, 2.0f);
+
+            addr_to_idx_[neighbor_ea] = nodes_.size();
+            nodes_.push_back(node);
+        }
+
+        // Add edges for new nodes
+        for (ea_t neighbor_ea : new_neighbors) {
+            if (addr_to_idx_.find(neighbor_ea) == addr_to_idx_.end()) continue;
+
+            func_t* nfunc = get_func(neighbor_ea);
+            if (!nfunc) continue;
+
+            // Find calls from this function
+            func_item_iterator_t fii2;
+            for (bool ok = fii2.set(nfunc); ok; ok = fii2.next_code()) {
+                ea_t item_ea = fii2.current();
+                xrefblk_t xb4;
+                for (bool ok2 = xb4.first_from(item_ea, XREF_FAR); ok2; ok2 = xb4.next_from()) {
+                    if (xb4.type != fl_CF && xb4.type != fl_CN && xb4.type != fl_JF && xb4.type != fl_JN)
+                        continue;
+
+                    func_t* callee_func = get_func(xb4.to);
+                    if (!callee_func) continue;
+
+                    ea_t callee_ea = callee_func->start_ea;
+                    if (addr_to_idx_.find(callee_ea) != addr_to_idx_.end()) {
+                        CallEdge edge;
+                        edge.from = neighbor_ea;
+                        edge.to = callee_ea;
+                        edges_.push_back(edge);
+                    }
+                }
+            }
+
+            // Find calls to this function (from existing nodes)
+            xrefblk_t xb5;
+            for (bool ok = xb5.first_to(neighbor_ea, XREF_FAR); ok; ok = xb5.next_to()) {
+                if (xb5.type != fl_CF && xb5.type != fl_CN && xb5.type != fl_JF && xb5.type != fl_JN)
+                    continue;
+
+                func_t* caller_func = get_func(xb5.from);
+                if (!caller_func) continue;
+
+                ea_t caller_ea = caller_func->start_ea;
+                if (addr_to_idx_.find(caller_ea) != addr_to_idx_.end()) {
+                    CallEdge edge;
+                    edge.from = caller_ea;
+                    edge.to = neighbor_ea;
+                    edges_.push_back(edge);
+                }
+            }
+        }
+
+        // Restart simulation to settle new nodes
+        simulation_running_ = true;
+        simulation_iterations_ = std::max(0, simulation_iterations_ - 100);
+    }
+
+    /// Rebuild graph from base state plus neighbors of all followed nodes
+    /// Called when unfollowing a node to properly remove dynamically added nodes
+    void rebuild_from_base_with_follows() {
+        if (base_nodes_.empty()) return;
+
+        // Start from base state
+        nodes_ = base_nodes_;
+        edges_ = base_edges_;
+        addr_to_idx_ = base_addr_to_idx_;
+
+        // Re-add neighbors for all remaining followed nodes
+        for (ea_t followed_addr : followed_nodes_) {
+            // Mark the followed node
+            auto it = addr_to_idx_.find(followed_addr);
+            if (it != addr_to_idx_.end()) {
+                nodes_[it->second].is_followed = true;
+            }
+            // Add its neighbors
+            add_neighbors_to_graph(followed_addr);
+        }
+
+        // Update selected_node_idx_ to match new addr_to_idx_
+        if (selected_addr_ != BADADDR) {
+            auto sel_it = addr_to_idx_.find(selected_addr_);
+            if (sel_it != addr_to_idx_.end()) {
+                selected_node_idx_ = static_cast<int>(sel_it->second);
+            } else {
+                selected_node_idx_ = -1;
+            }
+        }
+    }
+
+    /// Compute distances from all followed nodes (BFS) and update opacity
+    void compute_follow_distances() {
+        // Reset follow distances
+        for (auto& node : nodes_) {
+            node.follow_distance = -1;
+            node.is_followed = (followed_nodes_.find(node.address) != followed_nodes_.end());
+        }
+
+        if (followed_nodes_.empty()) {
+            // No followed nodes - full opacity for all
+            for (auto& node : nodes_) {
+                node.opacity = 1.0f;
+            }
+            return;
+        }
+
+        // BFS from all followed nodes simultaneously
+        std::vector<std::size_t> queue;
+        for (std::size_t i = 0; i < nodes_.size(); ++i) {
+            if (nodes_[i].is_followed) {
+                nodes_[i].follow_distance = 0;
+                queue.push_back(i);
+            }
+        }
+
+        std::size_t head = 0;
+        int max_follow_dist = 0;
+        while (head < queue.size()) {
+            std::size_t current_idx = queue[head++];
+            int current_dist = nodes_[current_idx].follow_distance;
+            ea_t current_addr = nodes_[current_idx].address;
+
+            // Find neighbors via edges
+            for (const auto& edge : edges_) {
+                std::size_t neighbor_idx = SIZE_MAX;
+                if (edge.from == current_addr) {
+                    auto it = addr_to_idx_.find(edge.to);
+                    if (it != addr_to_idx_.end()) neighbor_idx = it->second;
+                } else if (edge.to == current_addr) {
+                    auto it = addr_to_idx_.find(edge.from);
+                    if (it != addr_to_idx_.end()) neighbor_idx = it->second;
+                }
+
+                if (neighbor_idx != SIZE_MAX && nodes_[neighbor_idx].follow_distance < 0) {
+                    int new_dist = current_dist + 1;
+                    nodes_[neighbor_idx].follow_distance = new_dist;
+                    max_follow_dist = std::max(max_follow_dist, new_dist);
+                    queue.push_back(neighbor_idx);
+                }
+            }
+        }
+
+        // Update opacity based on follow distance
+        // Followed nodes = full opacity, further = lower opacity
+        for (auto& node : nodes_) {
+            if (node.is_followed) {
+                node.opacity = 1.0f;
+            } else if (node.follow_distance >= 0) {
+                // Fade out with distance: 1.0 at dist 0, down to min_opacity at max distance
+                float t = static_cast<float>(node.follow_distance) / static_cast<float>(std::max(max_follow_dist, 1));
+                node.opacity = 1.0f - t * (1.0f - 0.15f);  // 0.15 minimum opacity
+            } else {
+                // Disconnected from any followed node
+                node.opacity = 0.08f;
+            }
         }
     }
 
@@ -823,6 +1151,66 @@ private:
             ImGui::TextDisabled("(removes unrelated)");
         }
 
+        bool prev_skip_hubs = skip_hub_nodes_;
+        ImGui::Checkbox("Skip Hub Nodes", &skip_hub_nodes_);
+        if (skip_hub_nodes_ != prev_skip_hubs && only_show_neighbors_ && selected_addr_ != BADADDR) {
+            // Re-load with new hub setting
+            load_neighbors_from_ea(selected_addr_);
+            restart_simulation();
+        }
+        if (skip_hub_nodes_) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(20+ conns)");
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Lock Mode:");
+
+        bool prev_locked = graph_locked_;
+        ImGui::Checkbox("Lock Graph", &graph_locked_);
+        if (graph_locked_ != prev_locked) {
+            if (graph_locked_) {
+                // Locking: capture current graph as base state for follow mode
+                base_nodes_ = nodes_;
+                base_edges_ = edges_;
+                base_addr_to_idx_ = addr_to_idx_;
+            } else {
+                // Unlocking: clear followed nodes and restore base state
+                followed_nodes_.clear();
+                nodes_ = base_nodes_;
+                edges_ = base_edges_;
+                addr_to_idx_ = base_addr_to_idx_;
+                for (auto& node : nodes_) {
+                    node.is_followed = false;
+                    node.follow_distance = -1;
+                }
+                // Update selected_node_idx_ to match restored addr_to_idx_
+                if (selected_addr_ != BADADDR) {
+                    auto sel_it = addr_to_idx_.find(selected_addr_);
+                    if (sel_it != addr_to_idx_.end()) {
+                        selected_node_idx_ = static_cast<int>(sel_it->second);
+                    } else {
+                        selected_node_idx_ = -1;
+                    }
+                }
+                compute_distances_from_selection();
+                // Clear base state
+                base_nodes_.clear();
+                base_edges_.clear();
+                base_addr_to_idx_.clear();
+            }
+        }
+        if (graph_locked_) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(Alt+click to follow)");
+
+            if (!followed_nodes_.empty()) {
+                ImGui::Text("Following: %zu nodes", followed_nodes_.size());
+            } else {
+                ImGui::TextDisabled("Alt+click nodes to follow");
+            }
+        }
+
         ImGui::Separator();
 
         if (ImGui::Checkbox("Free Flight", &camera_.free_flight)) {
@@ -853,6 +1241,9 @@ private:
         }
         ImGui::BulletText("Click node: Select");
         ImGui::BulletText("Click empty: Deselect");
+        if (graph_locked_) {
+            ImGui::BulletText("Alt+Click: Follow/Unfollow");
+        }
 
         ImGui::Separator();
 
@@ -976,6 +1367,9 @@ private:
         // Only trigger on mouse release (was_clicked) and only if it was a short click (not a drag)
         bool is_short_click = was_clicked && was_short_click();
 
+        ImGuiIO& io = ImGui::GetIO();
+        bool alt_pressed = io.KeyAlt;
+
         if (is_short_click && hovered_node_idx_ < 0) {
             // Short click on empty canvas - deselect
             if (only_show_neighbors_) {
@@ -986,10 +1380,19 @@ private:
                 compute_distances_from_selection();
             }
         } else if (is_short_click && hovered_node_idx_ >= 0) {
-            // Short click on a node - select it
+            // Short click on a node
             if (hovered_node_idx_ < static_cast<int>(nodes_.size())) {
                 ea_t clicked_addr = nodes_[hovered_node_idx_].address;
-                if (clicked_addr != selected_addr_) {
+
+                if (graph_locked_) {
+                    // In locked mode: Alt+click toggles follow, regular click just navigates
+                    if (alt_pressed) {
+                        toggle_follow_node(clicked_addr);
+                    }
+                    // Always navigate to the node in IDA when clicking in locked mode
+                    jumpto(clicked_addr);
+                } else if (clicked_addr != selected_addr_) {
+                    // Normal mode: select node and update graph
                     selected_addr_ = clicked_addr;
                     if (only_show_neighbors_) {
                         // In focused mode: do targeted load around clicked node
@@ -1233,6 +1636,8 @@ private:
             // Color based on importance and selection state
             ImU32 color;
             int alpha = static_cast<int>(node.opacity * 255);
+            bool is_hub_node = node.is_hub;
+            bool is_followed_node = node.is_followed;
 
             if (nr.idx == selected_node_idx_) {
                 // Selected node - bright green
@@ -1242,6 +1647,23 @@ private:
                 // Hovered node - yellow
                 color = IM_COL32(255, 255, 100, alpha);
                 size *= 1.3f;
+            } else if (is_followed_node) {
+                // Followed node (in lock mode) - bright magenta/purple
+                color = IM_COL32(220, 100, 255, alpha);
+                size *= 1.3f;
+            } else if (is_hub_node) {
+                // Hub node (many connections, not traversed) - orange/amber
+                color = IM_COL32(255, 165, 50, alpha);
+                size *= 1.2f;
+            } else if (graph_locked_ && !followed_nodes_.empty() && node.follow_distance >= 0) {
+                // In lock mode with followed nodes: color by distance from followed
+                float max_dist = 10.0f;  // Assume reasonable max
+                float t = 1.0f - std::min(static_cast<float>(node.follow_distance) / max_dist, 1.0f);
+                // Gradient: gray (far) -> purple tint (close to followed)
+                int r = static_cast<int>(80 + t * 100);
+                int g = static_cast<int>(80 + t * 60);
+                int b = static_cast<int>(120 + t * 100);
+                color = IM_COL32(r, g, b, alpha);
             } else if (selected_node_idx_ >= 0 && node.graph_distance >= 0) {
                 // Connected to selected node - color by distance
                 float t = node.importance;
@@ -1262,26 +1684,37 @@ private:
                 color = IM_COL32(r, g, b, alpha);
             }
 
-            // Draw node
-            draw_list->AddCircleFilled(screen_pos, size, color);
+            // Draw node - hub nodes as rings, others as filled circles
+            if (is_hub_node) {
+                draw_list->AddCircle(screen_pos, size, color, 0, 3.0f);
+                draw_list->AddCircleFilled(screen_pos, size * 0.5f, color);
+            } else {
+                draw_list->AddCircleFilled(screen_pos, size, color);
+            }
 
-            // Outline for selected/hovered
+            // Outline for selected/hovered/followed
             if (nr.idx == selected_node_idx_ || nr.idx == hovered_node_idx_) {
                 draw_list->AddCircle(screen_pos, size + 2, IM_COL32(255, 255, 255, alpha), 0, 2.0f);
+            } else if (is_followed_node) {
+                // Double ring for followed nodes
+                draw_list->AddCircle(screen_pos, size + 3, IM_COL32(220, 100, 255, alpha), 0, 2.0f);
+                draw_list->AddCircle(screen_pos, size + 6, IM_COL32(180, 80, 220, static_cast<int>(alpha * 0.6f)), 0, 1.5f);
             }
 
             // Labels - show if:
             // 1. Labels enabled AND within label distance, OR
             // 2. This is selected/hovered node, OR
-            // 3. This is a direct neighbor (distance 1) of selected node
+            // 3. This is a direct neighbor (distance 1) of selected node, OR
+            // 4. This is a followed node (in lock mode)
             bool is_direct_neighbor = (selected_node_idx_ >= 0 && node.graph_distance == 1);
             bool is_selected_or_hovered = (nr.idx == selected_node_idx_ || nr.idx == hovered_node_idx_);
             bool within_label_distance = (show_labels_ && node.opacity > 0.5f && nr.depth < label_distance_);
+            bool is_followed_for_label = is_followed_node;
 
-            if (within_label_distance || is_selected_or_hovered || is_direct_neighbor) {
+            if (within_label_distance || is_selected_or_hovered || is_direct_neighbor || is_followed_for_label) {
                 int text_alpha = static_cast<int>(node.opacity * 200);
-                if (is_direct_neighbor && !within_label_distance) {
-                    text_alpha = 220;  // Ensure direct neighbors are visible
+                if ((is_direct_neighbor || is_followed_for_label) && !within_label_distance) {
+                    text_alpha = 220;  // Ensure direct neighbors and followed are visible
                 }
                 ImU32 text_color = IM_COL32(200, 200, 200, text_alpha);
                 draw_list->AddText(
@@ -1336,11 +1769,22 @@ private:
     float label_distance_ = 15.0f;
     bool show_edges_ = true;
     bool show_labels_ = false;
+    bool skip_hub_nodes_ = true;  // Don't traverse nodes with 20+ connections
 
     // EA tracking
     bool track_ea_ = false;
     ea_t current_ea_ = BADADDR;
     bool only_show_neighbors_ = false;
+
+    // Lock mode - prevents graph from updating, allows following nodes
+    bool graph_locked_ = false;
+    std::unordered_set<ea_t> followed_nodes_;  // Nodes being followed (Alt+click to toggle)
+
+    // Base state for follow mode - captured when lock mode is enabled
+    // Used to rebuild graph when unfollowing nodes
+    std::vector<GraphNode> base_nodes_;
+    std::vector<CallEdge> base_edges_;
+    std::unordered_map<ea_t, std::size_t> base_addr_to_idx_;
 };
 
 // =============================================================================
