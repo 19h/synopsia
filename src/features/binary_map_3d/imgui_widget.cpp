@@ -9,6 +9,11 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 
+// DAG Flowchart layout library
+#include "layout/GraphGridLayout.h"
+#include "core/GraphLayout.h"
+#include "core/PointF.h"
+
 #include <cmath>
 #include <cctype>
 #include <memory>
@@ -195,6 +200,13 @@ struct GraphNode {
     float importance = 0.0f;  // 0-1, relative to selected node
     float opacity = 1.0f;
     float scale = 1.0f;
+};
+
+// Edge polyline for DAG flowchart layout (orthogonal routing)
+struct DAGEdgePolyline {
+    ea_t from_addr;
+    ea_t to_addr;
+    std::vector<Vec3> points;  // Sequence of points forming the routed edge
 };
 
 // =============================================================================
@@ -920,6 +932,12 @@ private:
     }
 
     void init_positions() {
+        if (mode_dag_) {
+            // DAG mode: use hierarchical flowchart layout
+            compute_dag_flowchart_layout();
+            return;
+        }
+
         if (mode_2d_) {
             // 2D mode: use KK + modified FR layout (Gabriel et al.)
             compute_2d_force_layout();
@@ -1204,9 +1222,109 @@ private:
         }
     }
 
+    /// Compute DAG flowchart layout using GraphGridLayout library
+    /// Produces a hierarchical layout with orthogonal edge routing
+    void compute_dag_flowchart_layout() {
+        if (nodes_.empty()) return;
+
+        // Build GraphLayout::Graph from our nodes and edges
+        GraphLayout::Graph graph;
+
+        // Create blocks from nodes
+        for (const auto& node : nodes_) {
+            GraphLayout::GraphBlock block;
+            block.entry = static_cast<uint64_t>(node.address);
+            // Block dimensions - affects spacing calculations
+            block.width = 100;   // Reasonable default for function nodes
+            block.height = 30;
+            graph[block.entry] = block;
+        }
+
+        // Add edges to source blocks
+        for (const auto& edge : edges_) {
+            uint64_t from_id = static_cast<uint64_t>(edge.from);
+            uint64_t to_id = static_cast<uint64_t>(edge.to);
+
+            if (graph.count(from_id) && graph.count(to_id)) {
+                graph[from_id].edges.emplace_back(to_id);
+            }
+        }
+
+        if (graph.empty()) return;
+
+        // Determine entry point
+        uint64_t entry_id;
+        if (selected_node_idx_ >= 0 && selected_node_idx_ < static_cast<int>(nodes_.size())) {
+            entry_id = static_cast<uint64_t>(nodes_[selected_node_idx_].address);
+        } else {
+            entry_id = graph.begin()->first;
+        }
+
+        // Create layout and compute
+        GraphGridLayout layout(GraphGridLayout::LayoutType::Medium);
+        
+        // Configure for call graph visualization
+        layout.setLayoutConfig({
+            .blockVerticalSpacing = 50,
+            .blockHorizontalSpacing = 25,
+            .edgeVerticalSpacing = 8,
+            .edgeHorizontalSpacing = 8
+        });
+
+        int canvas_width, canvas_height;
+        layout.CalculateLayout(graph, entry_id, canvas_width, canvas_height);
+
+        // Store edge polylines for rendering
+        dag_edge_polylines_.clear();
+        
+        // Convert positions back to our coordinate system
+        // Scale to reasonable graph units (pixels -> units)
+        const float scale = 0.02f;  // Adjust based on typical canvas size
+        
+        // Find center for centering
+        float cx = 0, cy = 0;
+        for (const auto& [id, block] : graph) {
+            cx += block.x + block.width * 0.5f;
+            cy += block.y + block.height * 0.5f;
+        }
+        cx /= static_cast<float>(graph.size());
+        cy /= static_cast<float>(graph.size());
+
+        // Update node positions from layout
+        for (auto& node : nodes_) {
+            uint64_t id = static_cast<uint64_t>(node.address);
+            auto it = graph.find(id);
+            if (it != graph.end()) {
+                const auto& block = it->second;
+                // Center of block, scaled and centered
+                node.pos.x = (block.x + block.width * 0.5f - cx) * scale;
+                node.pos.y = -(block.y + block.height * 0.5f - cy) * scale;  // Flip Y
+                node.pos.z = 0.0f;
+                node.vel = Vec3(0, 0, 0);
+
+                // Store edge polylines for this block
+                for (const auto& edge : block.edges) {
+                    if (edge.polyline.size() >= 2) {
+                        DAGEdgePolyline poly;
+                        poly.from_addr = node.address;
+                        poly.to_addr = static_cast<ea_t>(edge.target);
+                        poly.points.reserve(edge.polyline.size());
+                        for (const auto& pt : edge.polyline) {
+                            // Scale and center like node positions
+                            float px = (static_cast<float>(pt.x) - cx) * scale;
+                            float py = -(static_cast<float>(pt.y) - cy) * scale;
+                            poly.points.push_back(Vec3(px, py, 0.0f));
+                        }
+                        dag_edge_polylines_.push_back(std::move(poly));
+                    }
+                }
+            }
+        }
+    }
+
     void step_simulation() {
-        // 2D mode uses static hierarchical layout, no force simulation needed
-        if (mode_2d_) {
+        // 2D and DAG modes use static layouts, no force simulation needed
+        if (mode_2d_ || mode_dag_) {
             simulation_running_ = false;
             return;
         }
@@ -1518,23 +1636,43 @@ private:
         ImGui::Text("View Mode:");
 
         bool prev_2d = mode_2d_;
-        if (ImGui::Checkbox("2D Flowgraph", &mode_2d_)) {
+        if (ImGui::Checkbox("2D Force Layout", &mode_2d_)) {
             if (mode_2d_ != prev_2d) {
+                // Disable DAG mode when enabling 2D
+                if (mode_2d_) mode_dag_ = false;
                 // Exit free flight when switching to 2D
                 if (mode_2d_ && camera_.free_flight) {
                     camera_.exit_free_flight();
                 }
-                // Restart simulation to re-layout in 2D/3D
+                // Restart simulation to re-layout
                 restart_simulation();
             }
         }
         if (mode_2d_) {
             ImGui::SameLine();
-            ImGui::TextDisabled("(hierarchical)");
+            ImGui::TextDisabled("(KK+FR)");
+        }
+
+        bool prev_dag = mode_dag_;
+        if (ImGui::Checkbox("DAG Flowchart", &mode_dag_)) {
+            if (mode_dag_ != prev_dag) {
+                // Disable 2D mode when enabling DAG
+                if (mode_dag_) mode_2d_ = false;
+                // Exit free flight when switching to DAG
+                if (mode_dag_ && camera_.free_flight) {
+                    camera_.exit_free_flight();
+                }
+                // Restart simulation to re-layout
+                restart_simulation();
+            }
+        }
+        if (mode_dag_) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(orthogonal)");
         }
 
         // Free Flight only available in 3D mode
-        if (!mode_2d_) {
+        if (!mode_2d_ && !mode_dag_) {
             if (ImGui::Checkbox("Free Flight", &camera_.free_flight)) {
                 if (camera_.free_flight) {
                     camera_.enter_free_flight();
@@ -1567,7 +1705,7 @@ private:
 
         ImGui::Separator();
         ImGui::Text("Controls:");
-        if (mode_2d_) {
+        if (mode_2d_ || mode_dag_) {
             ImGui::BulletText("Drag: Pan");
             ImGui::BulletText("Scroll: Zoom");
         } else if (camera_.free_flight) {
@@ -1830,8 +1968,8 @@ private:
                 move_speed_ *= (1.0f + io.MouseWheel * 0.1f);
                 move_speed_ = std::clamp(move_speed_, 0.05f, 5.0f);
             }
-        } else if (mode_2d_) {
-            // 2D camera controls: pan and zoom
+        } else if (mode_2d_ || mode_dag_) {
+            // 2D/DAG camera controls: pan and zoom
             if (is_active && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                 // Pan with left mouse drag
                 float pan_speed = 1.0f / camera_.zoom_2d;
@@ -1889,8 +2027,8 @@ private:
                 // Skip very faded nodes
                 if (node.opacity < 0.1f) continue;
 
-                ImVec2 screen_pos = mode_2d_ ? camera_.project_2d(node.pos, canvas_size)
-                                             : camera_.project(node.pos, canvas_size);
+                ImVec2 screen_pos = (mode_2d_ || mode_dag_) ? camera_.project_2d(node.pos, canvas_size)
+                                                          : camera_.project(node.pos, canvas_size);
                 screen_pos.x += canvas_pos.x;
                 screen_pos.y += canvas_pos.y;
 
@@ -1918,6 +2056,12 @@ private:
     }
 
     void draw_edges(ImDrawList* draw_list, const ImVec2& canvas_pos, const ImVec2& canvas_size) {
+        // In DAG mode, use precomputed polylines for orthogonal routing
+        if (mode_dag_ && !dag_edge_polylines_.empty()) {
+            draw_dag_edges(draw_list, canvas_pos, canvas_size);
+            return;
+        }
+
         for (const auto& edge : edges_) {
             auto it_from = addr_to_idx_.find(edge.from);
             auto it_to = addr_to_idx_.find(edge.to);
@@ -1933,17 +2077,17 @@ private:
             // Note: In "only neighbors" mode, edges_ is already filtered to only contain
             // edges between filtered nodes, so no additional visibility check needed
 
-            ImVec2 from_screen = mode_2d_ ? camera_.project_2d(from_node.pos, canvas_size)
-                                          : camera_.project(from_node.pos, canvas_size);
-            ImVec2 to_screen = mode_2d_ ? camera_.project_2d(to_node.pos, canvas_size)
-                                        : camera_.project(to_node.pos, canvas_size);
+            ImVec2 from_screen = (mode_2d_ || mode_dag_) ? camera_.project_2d(from_node.pos, canvas_size)
+                                                        : camera_.project(from_node.pos, canvas_size);
+            ImVec2 to_screen = (mode_2d_ || mode_dag_) ? camera_.project_2d(to_node.pos, canvas_size)
+                                                       : camera_.project(to_node.pos, canvas_size);
 
             from_screen.x += canvas_pos.x;
             from_screen.y += canvas_pos.y;
             to_screen.x += canvas_pos.x;
             to_screen.y += canvas_pos.y;
 
-            if (!mode_2d_ && (from_screen.x < -5000 || to_screen.x < -5000)) continue;
+            if (!mode_2d_ && !mode_dag_ && (from_screen.x < -5000 || to_screen.x < -5000)) continue;
 
             // Color based on importance
             ImU32 edge_color;
@@ -1962,6 +2106,89 @@ private:
         }
     }
 
+    void draw_dag_edges(ImDrawList* draw_list, const ImVec2& canvas_pos, const ImVec2& canvas_size) {
+        for (const auto& poly : dag_edge_polylines_) {
+            if (poly.points.size() < 2) continue;
+
+            // Get opacity from endpoint nodes
+            float edge_opacity = 1.0f;
+            auto it_from = addr_to_idx_.find(poly.from_addr);
+            auto it_to = addr_to_idx_.find(poly.to_addr);
+            if (it_from != addr_to_idx_.end() && it_to != addr_to_idx_.end()) {
+                edge_opacity = std::min(nodes_[it_from->second].opacity, 
+                                        nodes_[it_to->second].opacity);
+            }
+            if (edge_opacity < 0.05f) continue;
+
+            // Color based on importance
+            ImU32 edge_color;
+            if (selected_node_idx_ >= 0 && it_from != addr_to_idx_.end() && it_to != addr_to_idx_.end()) {
+                const auto& from_node = nodes_[it_from->second];
+                const auto& to_node = nodes_[it_to->second];
+                int alpha = static_cast<int>(edge_opacity * 150);
+                if (from_node.importance > 0.5f || to_node.importance > 0.5f) {
+                    edge_color = IM_COL32(100, 150, 255, alpha);
+                } else {
+                    edge_color = IM_COL32(80, 80, 120, alpha);
+                }
+            } else {
+                edge_color = IM_COL32(80, 100, 140, static_cast<int>(edge_opacity * 120));
+            }
+
+            // Draw polyline segments
+            for (std::size_t i = 0; i < poly.points.size() - 1; ++i) {
+                ImVec2 p1 = camera_.project_2d(poly.points[i], canvas_size);
+                ImVec2 p2 = camera_.project_2d(poly.points[i + 1], canvas_size);
+                p1.x += canvas_pos.x;
+                p1.y += canvas_pos.y;
+                p2.x += canvas_pos.x;
+                p2.y += canvas_pos.y;
+                draw_list->AddLine(p1, p2, edge_color, 1.5f);
+            }
+
+            // Draw arrowhead at the end
+            if (poly.points.size() >= 2) {
+                std::size_t last = poly.points.size() - 1;
+                ImVec2 end_pt = camera_.project_2d(poly.points[last], canvas_size);
+                ImVec2 prev_pt = camera_.project_2d(poly.points[last - 1], canvas_size);
+                end_pt.x += canvas_pos.x;
+                end_pt.y += canvas_pos.y;
+                prev_pt.x += canvas_pos.x;
+                prev_pt.y += canvas_pos.y;
+
+                // Compute arrow direction
+                float dx = end_pt.x - prev_pt.x;
+                float dy = end_pt.y - prev_pt.y;
+                float len = std::sqrt(dx * dx + dy * dy);
+                if (len > 0.1f) {
+                    dx /= len;
+                    dy /= len;
+
+                    // Arrow size
+                    float arrow_size = 6.0f;
+                    float arrow_width = 3.0f;
+
+                    // Perpendicular vector
+                    float px = -dy;
+                    float py = dx;
+
+                    // Arrow points
+                    ImVec2 arrow_tip = end_pt;
+                    ImVec2 arrow_left = ImVec2(
+                        end_pt.x - dx * arrow_size + px * arrow_width,
+                        end_pt.y - dy * arrow_size + py * arrow_width
+                    );
+                    ImVec2 arrow_right = ImVec2(
+                        end_pt.x - dx * arrow_size - px * arrow_width,
+                        end_pt.y - dy * arrow_size - py * arrow_width
+                    );
+
+                    draw_list->AddTriangleFilled(arrow_tip, arrow_left, arrow_right, edge_color);
+                }
+            }
+        }
+    }
+
     void draw_nodes(ImDrawList* draw_list, const ImVec2& canvas_pos, const ImVec2& canvas_size) {
         // Sort by depth for proper rendering order (in 3D) or just render in order (in 2D)
         struct NodeRender {
@@ -1972,8 +2199,8 @@ private:
         sorted.reserve(nodes_.size());
 
         for (std::size_t i = 0; i < nodes_.size(); ++i) {
-            float depth = mode_2d_ ? camera_.get_depth_2d(nodes_[i].pos)
-                                   : camera_.get_depth(nodes_[i].pos);
+            float depth = (mode_2d_ || mode_dag_) ? camera_.get_depth_2d(nodes_[i].pos)
+                                                 : camera_.get_depth(nodes_[i].pos);
             sorted.push_back({static_cast<int>(i), depth});
         }
 
@@ -1989,8 +2216,8 @@ private:
             // Note: In "only neighbors" mode, nodes_ is already filtered to only contain
             // nodes within max_depth of selection, so no additional visibility check needed
 
-            ImVec2 screen_pos = mode_2d_ ? camera_.project_2d(node.pos, canvas_size)
-                                         : camera_.project(node.pos, canvas_size);
+            ImVec2 screen_pos = (mode_2d_ || mode_dag_) ? camera_.project_2d(node.pos, canvas_size)
+                                                       : camera_.project(node.pos, canvas_size);
             screen_pos.x += canvas_pos.x;
             screen_pos.y += canvas_pos.y;
 
@@ -2002,8 +2229,8 @@ private:
                 continue;
             }
 
-            // Size with depth perspective (no perspective in 2D mode)
-            float depth_scale = mode_2d_ ? 1.0f : (1.0f / (1.0f + nr.depth * 0.05f));
+            // Size with depth perspective (no perspective in 2D/DAG mode)
+            float depth_scale = (mode_2d_ || mode_dag_) ? 1.0f : (1.0f / (1.0f + nr.depth * 0.05f));
             float size = base_node_size_ * node.scale * depth_scale;
             size = std::clamp(size, 2.0f, 30.0f);
 
@@ -2144,7 +2371,11 @@ private:
     bool show_edges_ = true;
     bool show_labels_ = false;
     bool skip_hub_nodes_ = true;  // Don't traverse nodes with 20+ connections
-    bool mode_2d_ = false;        // 2D mode (default is 3D)
+    bool mode_2d_ = false;        // 2D force layout mode
+    bool mode_dag_ = false;       // DAG flowchart layout mode
+
+    // DAG layout edge polylines (for orthogonal routing)
+    std::vector<DAGEdgePolyline> dag_edge_polylines_;
 
     // EA tracking
     bool track_ea_ = false;

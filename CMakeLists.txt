@@ -324,6 +324,18 @@ set(SYNOPSIA_IMGUI_SOURCES
     src/imgui/qt_imgui_widget.cpp
 )
 
+# DAG Flowchart library (vendored)
+set(DAG_FLOWCHART_SOURCES
+    vendor/dag-flowchart/src/graph/GraphTraversal.cpp
+    vendor/dag-flowchart/src/layout/CoordinateConverter.cpp
+    vendor/dag-flowchart/src/layout/GraphGridLayout.cpp
+    vendor/dag-flowchart/src/optimization/LayoutOptimizer.cpp
+    vendor/dag-flowchart/src/optimization/LinearProgramming.cpp
+    vendor/dag-flowchart/src/routing/SegmentOffset.cpp
+    vendor/dag-flowchart/src/routing/EdgeRouter.cpp
+    vendor/dag-flowchart/src/placement/BlockPlacer.cpp
+)
+
 # All sources combined
 set(SYNOPSIA_SOURCES
     ${SYNOPSIA_CORE_SOURCES}
@@ -332,6 +344,7 @@ set(SYNOPSIA_SOURCES
     ${SYNOPSIA_FUNCTION_SEARCH_SOURCES}
     ${SYNOPSIA_BINARY_MAP_3D_SOURCES}
     ${SYNOPSIA_IMGUI_SOURCES}
+    ${DAG_FLOWCHART_SOURCES}
     ${IMGUI_SOURCES}
     ${IMGUI_COLOR_TEXT_EDIT_SOURCES}
 )
@@ -372,6 +385,7 @@ add_library(synopsia${IDA_SUFFIX} SHARED ${SYNOPSIA_SOURCES} ${SYNOPSIA_HEADERS}
 
 target_include_directories(synopsia${IDA_SUFFIX} PRIVATE
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/vendor/dag-flowchart/include
     ${IDA_INCLUDE_DIR}
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
