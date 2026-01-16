@@ -927,13 +927,23 @@ private:
         }
 
         // 3D mode: initialize with random positions on a sphere
+        // Place selected node at center if available
         std::mt19937 rng(42);
         std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
         float radius = std::sqrt(static_cast<float>(nodes_.size())) * 0.5f;
         if (radius < 1.0f) radius = 1.0f;
 
-        for (auto& node : nodes_) {
+        for (std::size_t i = 0; i < nodes_.size(); ++i) {
+            auto& node = nodes_[i];
+            
+            // Place selected node at center
+            if (static_cast<int>(i) == selected_node_idx_) {
+                node.pos = Vec3(0, 0, 0);
+                node.vel = Vec3(0, 0, 0);
+                continue;
+            }
+            
             Vec3 p;
             do {
                 p = Vec3(dist(rng), dist(rng), dist(rng));
@@ -1249,8 +1259,18 @@ private:
         }
 
         // Apply velocities with damping
+        // Keep selected node fixed at center
         float max_vel = 0.0f;
-        for (auto& node : nodes_) {
+        for (std::size_t i = 0; i < nodes_.size(); ++i) {
+            auto& node = nodes_[i];
+            
+            // Keep selected node fixed at center
+            if (static_cast<int>(i) == selected_node_idx_) {
+                node.pos = Vec3(0, 0, 0);
+                node.vel = Vec3(0, 0, 0);
+                continue;
+            }
+            
             node.vel = node.vel * damping;
             node.pos += node.vel * dt;
             max_vel = std::max(max_vel, node.vel.length());
@@ -1319,11 +1339,16 @@ private:
     }
 
     void render_info_panel() {
+        // Wrap entire panel in scrollable child to prevent affecting graph layout
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        ImGui::BeginChild("##info-panel", avail, false, ImGuiWindowFlags_NoBackground);
+        
         ImGui::Text("Call Graph");
         ImGui::Separator();
 
         if (!data_.is_valid()) {
             ImGui::TextDisabled("No data loaded");
+            ImGui::EndChild();
             return;
         }
 
@@ -1588,6 +1613,8 @@ private:
         } else {
             ImGui::TextDisabled("Click a node to select");
         }
+        
+        ImGui::EndChild();  // End info-panel scrollable child
     }
 
     void update_search_results() {
@@ -1821,7 +1848,7 @@ private:
 
                 float old_zoom = camera_.zoom_2d;
                 camera_.zoom_2d *= (1.0f + io.MouseWheel * 0.1f);
-                camera_.zoom_2d = std::clamp(camera_.zoom_2d, 5.0f, 500.0f);
+                camera_.zoom_2d = std::clamp(camera_.zoom_2d, 0.1f, 500.0f);
 
                 // Adjust pan to keep point under mouse stationary
                 float zoom_ratio = camera_.zoom_2d / old_zoom;
